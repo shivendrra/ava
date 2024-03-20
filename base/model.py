@@ -133,22 +133,6 @@ class FeedForward(nn.Module):
   def forward(self, x):
     return self.net(x)
 
-class Block(nn.Module):
-  def __init__(self, d_model, n_head, norm_eps, dropout):
-    super().__init__()
-    self.sa_masked = MultiHeadAttention(n_head=n_head, d_model=d_model, dropout=dropout)
-    self.ffwd = FeedForward(d_model, dropout=dropout)
-    self.norm1 = nn.LayerNorm(d_model, eps=norm_eps)
-    self.norm2 = nn.LayerNorm(d_model, eps=norm_eps)
-  
-  def forward(self, x):
-    x2 = x + self.sa_unmasked(self.norm1(x))
-    x = x2 + self.ffwd(self.norm2(x2))
-
-    x2 = x + self.sa_masked(self.norm1(x))
-    x = x2 + self.ffwd(self.norm2(x2))
-    return x
-
 class EncoderNetwork(nn.Module):
   def __init__(self, d_model, n_head, norm_eps, dropout, block_size):
     super().__init__()
@@ -199,7 +183,6 @@ class Transformer(nn.Module):
     super().__init__()
     self.toked_model = nn.Embedding(vocab_size, d_model)
     self.pos_encod = nn.Embedding(block_size, d_model)
-    self.block = nn.Sequential(*[Block(d_model=d_model, dropout=dropout, norm_eps=norm_eps, n_head=n_head) for _ in range(n_layers)])
     self.enc_layer = nn.ModuleList([EncoderNetwork(n_head=n_head, norm_eps=norm_eps, block_size=block_size, dropout=dropout, d_model=d_model) for _ in range(n_layers)])
     self.dec_layer = nn.ModuleList([DecoderNetwork(n_head=n_head, norm_eps=norm_eps, block_size=block_size, dropout=dropout, d_model=d_model) for _ in range(n_layers)])
 
@@ -221,14 +204,14 @@ class Transformer(nn.Module):
 
     toked_model = self.toked_model(idx)
     pos_encod = self.pos_encod(torch.arange(T, device=device))
-    x = toked_model + pos_encod
+    x_in = toked_model + pos_encod
 
     for layer in self.enc_layer:
-      x = layer(x, None)
-        
+      x_out = layer(x_in)
+
     for layer in self.dec_layer:
-      x = layer(x, x)
-    
+      x = layer(x_in, x_out)
+
     x = self.norm_final(x)
     logits = self.linear_final(x)
 
@@ -243,16 +226,31 @@ class Transformer(nn.Module):
     
     return logits, loss
   
-  def generate(self, idx, max_new_tokens):
+  def generate(self, idx, max_new_tokens, temperature=1.0, top_k=0):
+    generated_tokens = []
+
     for _ in range(max_new_tokens):
       idx_cond = idx[:, -block_size:]
-      logits, loss = self(idx_cond)
-      logits = logits[:, -1, :] # becomes (B, C)
-      probs = F.softmax(logits, dim=-1) # (B, C)
-      idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
-      idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+      logits, _ = self(idx_cond)
+      logits = logits[:, -1, :]
 
-    return idx
+      scaled_logits = logits / temperature
+      if top_k > 0:
+        scaled_logits = self._top_k_filtering(scaled_logits, top_k)
+
+      probs = F.softmax(scaled_logits, dim=-1)
+      sampled_idx = torch.multinomial(probs, num_samples=1)
+      generated_tokens.append(sampled_idx.item())
+      idx = torch.cat((idx, sampled_idx), dim=1)
+
+    return generated_tokens
+
+
+  def _top_k_filtering(self, logits, top_k):
+    values, indices = torch.topk(logits, top_k, dim=-1)
+    min_value = values[:, -1].unsqueeze(-1).expand_as(logits)
+    filtered_logits = torch.where(logits < min_value, torch.ones_like(logits) * -float('inf'), logits)
+    return filtered_logits
 
 model = Transformer()
 m = model.to(device)
