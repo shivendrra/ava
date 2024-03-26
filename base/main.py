@@ -28,7 +28,7 @@ class UnMaskedHead(nn.Module):
     output = torch.matmul(att_mat, value)
     return output
 
-class EncoderAttention(nn.Module):
+class UnMaskedAttention(nn.Module):
   def __init__(self, d_model, block_size, dropout, n_head):
     head_size = d_model // n_head
     super().__init__()
@@ -44,8 +44,8 @@ class EncoderAttention(nn.Module):
 class MaskedHead(nn.Module):
   def __init__(self, d_model, head_size, dropout, block_size):
     super().__init__()
-    self.key = nn.Linear(d_model, head_size, bias=True)
-    self.query = nn.Linear(d_model, head_size, bias=True)
+    self.key = nn.Linear(d_model, head_size, bias=False)
+    self.query = nn.Linear(d_model, head_size, bias=False)
     self.value = nn.Linear(d_model, head_size, bias=False)
     self.dropout = nn.Dropout(dropout)
     self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
@@ -77,6 +77,42 @@ class CasualMaskedAttention(nn.Module):
     out = self.dropout(self.proj(out))
     return out
 
+class FinalHead(nn.Module):
+  def __init__(self, d_model, head_size, dropout, block_size):
+    super().__init__()
+    self.key = nn.Linear(d_model, head_size, bias=True)
+    self.query = nn.Linear(d_model, head_size, bias=True)
+    self.value = nn.Linear(d_model, head_size, bias=True)
+    self.dropout = nn.Dropout(dropout)
+
+  def forward(self, x, att):
+    B, T, C = x.shape
+    key = self.key(att)
+    query = self.query(att)
+
+    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** -0.5)
+    rel_pos_scores = torch.einsum('btc,tvc->btv', query, self.rel_pos_embd[:T, :T])
+    scores = scores + rel_pos_scores
+
+    att_mat = F.softmax(scores, dim=-1)
+    att_mat = self.dropout(att_mat)
+    value = self.value(x)
+    output = torch.matmul(att_mat, value)
+    return output
+
+class FinalAttention(nn.Module):
+  def __init__(self, d_model, block_size, dropout, n_head):
+    head_size = d_model // n_head
+    super().__init__()
+    self.heads = nn.ModuleList([FinalHead(d_model=d_model, dropout=dropout, block_size=block_size, head_size=head_size) for _ in range(n_head)])
+    self.proj = nn.Linear(n_head * head_size, d_model)
+    self.dropout = nn.Dropout(dropout)
+  
+  def forward(self, x):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
+    out = self.dropout(self.proj(out))
+    return out
+
 class FeedForward(nn.Module):
   def __init__(self, d_model, dropout):
     super().__init__()
@@ -93,7 +129,7 @@ class FeedForward(nn.Module):
 class EncoderNetwork(nn.Module):
   def __init__(self, d_model, n_head, norm_eps, dropout, block_size):
     super().__init__()
-    self.s_att = EncoderAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
+    self.s_att = UnMaskedAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
     self.ffwd = FeedForward(d_model, dropout)
     self.dropout = nn.Dropout(dropout)
     self.norm1 = nn.LayerNorm(d_model, eps=norm_eps)
@@ -113,20 +149,21 @@ class EncoderNetwork(nn.Module):
 class DecoderNetwork(nn.Module):
   def __init__(self, d_model, n_head, norm_eps, dropout, block_size):
     super().__init__()
-    self.s_att = CasualMaskedAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
+    self.m_att = CasualMaskedAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
+    self.f_att = FinalAttention(d_model=d_model, n_head=n_head, dropout=dropout, block_size=block_size)
     self.ffwd = FeedForward(d_model, dropout)
     self.dropout = nn.Dropout(dropout)
     self.norm1 = nn.LayerNorm(d_model, eps=norm_eps)
     self.norm2 = nn.LayerNorm(d_model, eps=norm_eps)
 
   def forward(self, src, att):
-    src2 = self.s_att(src)
-    src = src + self.dropout(src2)
     src = src + self.norm1(src)
+    src2 = self.m_att(src)
+    src = src + self.dropout(src2)
 
-    att2 = self.s_att(att)
-    att2 = att + self.dropout(att2)
-    trg = att2 + self.norm1(att2)
+    f_out = self.f_att(src, att)
+    trg = self.norm1(f_out)
+    trg = att + self.dropout(trg)
 
     src_f2 = self.ffwd(self.norm2(trg))
     src_f = src_f + self.dropout(src_f2)
