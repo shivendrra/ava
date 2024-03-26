@@ -1,3 +1,16 @@
+import json
+with open('config.json', 'r', encoding='utf-8') as file:
+  params = json.load(file)
+
+# required parameters
+block_size = params['block_size']
+d_model = params['d_model']
+n_head = params['n_heads']
+n_layers = params['n_layers']
+learning_rate = params['learning_rate']
+dropout = params['dropout']
+norm_eps = params['norm_eps']
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -167,7 +180,7 @@ class DecoderNetwork(nn.Module):
     return src_f
 
 class Transformer(nn.Module):
-  def __init__(self, vocab_size, n_head, block_size, d_model, n_layers, norm_eps, dropout):
+  def __init__(self, vocab_size):
     super().__init__()
     self.block_size = block_size
     self.toked_model = nn.Embedding(vocab_size, d_model)
