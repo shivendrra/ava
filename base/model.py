@@ -17,12 +17,48 @@ from torch.nn import functional as F
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+class RMSNorm(nn.Module):
+  def __init__(self, dim: int, eps: float = 1e-6):
+    """
+      Initialize the RMSNorm normalization layer.
+      Args:
+        dim (int): The dimension of the input tensor.
+        eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
+      Attributes:
+        eps (float): A small value added to the denominator for numerical stability.
+        weight (nn.Parameter): Learnable scaling parameter.
+    """
+    super().__init__()
+    self.eps = eps
+    self.weight = nn.Parameter(torch.ones(dim))
+            
+  def _norm(self, x):
+    """
+      Apply the RMSNorm normalization to the input tensor.
+        Args:
+        x (torch.Tensor): The input tensor.
+      Returns:
+        torch.Tensor: The normalized tensor.
+    """
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+  
+  def forward(self, x):
+    """
+      Forward pass through the RMSNorm layer.
+      Args:
+          x (torch.Tensor): The input tensor.
+      Returns:
+          torch.Tensor: The output tensor after applying RMSNorm.
+    """
+    output = self._norm(x.float()).type_as(x)
+    return output * self.weight
+
 class UnMaskedHead(nn.Module):
   def __init__(self, head_size, d_model, block_size, dropout):
     super().__init__()
     self.key = nn.Linear(d_model, head_size, bias=True)
     self.query = nn.Linear(d_model, head_size, bias=True)
-    self.value = nn.Linear(d_model, head_size, bias=False)
+    self.value = nn.Linear(d_model, head_size, bias=True)
     self.dropout = nn.Dropout(dropout)
     self.rel_pos_embd = nn.Parameter(torch.randn(block_size, block_size, head_size))
   
@@ -145,7 +181,7 @@ class EncoderNetwork(nn.Module):
     self.s_att = UnMaskedAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
     self.ffwd = FeedForward(d_model, dropout)
     self.dropout = nn.Dropout(dropout)
-    self.norm = nn.LayerNorm(d_model, eps=norm_eps)
+    self.norm = RMSNorm(d_model, eps=norm_eps)
 
   def forward(self, src):
     src_att = self.s_att(self.norm(src))
@@ -164,7 +200,7 @@ class DecoderNetwork(nn.Module):
     self.f_att = FinalAttention(d_model=d_model, n_head=n_head, dropout=dropout, block_size=block_size)
     self.ffwd = FeedForward(d_model, dropout)
     self.dropout = nn.Dropout(dropout)
-    self.norm = nn.LayerNorm(d_model, eps=norm_eps)
+    self.norm = RMSNorm(d_model, eps=norm_eps)
 
   def forward(self, src, att):
     m_att_out = self.m_att(self.norm(src))
@@ -187,8 +223,7 @@ class Transformer(nn.Module):
     self.pos_encod = nn.Embedding(block_size, d_model)
     self.enc_layer = nn.ModuleList([EncoderNetwork(n_head=n_head, norm_eps=norm_eps, block_size=block_size, dropout=dropout, d_model=d_model) for _ in range(n_layers)])
     self.dec_layer = nn.ModuleList([DecoderNetwork(n_head=n_head, norm_eps=norm_eps, block_size=block_size, dropout=dropout, d_model=d_model) for _ in range(n_layers)])
-
-    self.norm_final = nn.LayerNorm(d_model)
+    self.norm = RMSNorm(d_model, eps=norm_eps)
     self.linear_final = nn.Linear(d_model, vocab_size)
     self.dropout = nn.Dropout(dropout)
     self.apply(self._init_weights)
