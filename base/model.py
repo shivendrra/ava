@@ -1,122 +1,115 @@
 import torch
-import os
-current_directory = os.path.dirname(os.path.abspath(__file__))
-os.chdir(current_directory)
-
-with open('../captions.txt', 'r', encoding='utf-8') as file:
-  captions = file.read()
-
-print(len(captions)/1e6, 'million letters')
-
-import tiktoken
-
-tokenizer = tiktoken.get_encoding("p50k_base")
-tokenizer = tiktoken.encoding_for_model("text-davinci-003")
-
-vocab_size = tokenizer.n_vocab
-
-# Train and test splits
-data = torch.tensor(tokenizer.encode(captions), dtype=torch.long)
-n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
-
-import math
 import torch.nn as nn
 from torch.nn import functional as F
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-# hyperparams
-batch_size = 8
-block_size = 16
-max_iters = 100
-eval_interval = 10
-learning_rate = 1e-6
-eval_iters = 5
-d_model = 64
-n_layers = 8
-n_head = 8
-dropout = 0.2
-norm_eps = 1e-5
-
-torch.manual_seed(1400)
-# data loading
-def get_batch(split):
-    # generate a small batch of data of inputs x and targets y
-    data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-    x, y = x.to(device), y.to(device)
-    return x, y
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
-
-class AttentionHead(nn.Module):
-  """ single head of self attention """
-
-  def __init__(self, d_model, head_size, dropout, block_size):
+class UnMaskedHead(nn.Module):
+  def __init__(self, head_size, d_model, block_size, dropout):
     super().__init__()
     self.key = nn.Linear(d_model, head_size, bias=True)
-    self.query = nn.Linear(d_model, head_size, bias=True) 
+    self.query = nn.Linear(d_model, head_size, bias=True)
     self.value = nn.Linear(d_model, head_size, bias=False)
     self.dropout = nn.Dropout(dropout)
-    self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-    
-    # relative positional encoding parameters
-    self.max_relative_pos = block_size
-    self.relative_embeddings = nn.Embedding(2 * self.max_relative_pos + 1, head_size)
+    self.rel_pos_embd = nn.Parameter(torch.randn(block_size, block_size, head_size))
   
-  def forward(self, x, mask=False):
+  def forward(self, x):
     B, T, C = x.shape
     key = self.key(x)
     query = self.query(x)
 
-    # compute relative positions
-    positions = torch.arange(T, device=x.device).unsqueeze(0).expand(B, -1)
-    relative_positions = positions[:, :, None] - positions[:, None, :]
-    clipped_positions = torch.clamp(relative_positions, -self.max_relative_pos, self.max_relative_pos)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** -0.5)
+    rel_pos_scores = torch.einsum('btc,tvc->btv', query, self.rel_pos_embd[:T, :T])
+    scores = scores + rel_pos_scores
 
-    relative_embeddings = self.relative_embeddings(clipped_positions + self.max_relative_pos)
-    query_with_pos = query + relative_embeddings
-    key_with_pos = key + relative_embeddings.transpose(1, 2)
-
-    # weights = query @ key.transpose(-2, -1) / (key.shape[-1]**-0.5)
-    weights = query_with_pos @ key_with_pos.transpose(-2, -1) / math.sqrt(query.shape[-1])
-
-    if mask is True:
-      weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-    
-    weights = F.softmax(weights, dim=-1)
-    weights = self.dropout(weights)
-
+    att_mat = F.softmax(scores, dim=-1)
+    att_mat = self.dropout(att_mat)
     value = self.value(x)
-    out = weights @ value
-    return out
+    output = torch.matmul(att_mat, value)
+    return output
 
-class MultiHeadAttention(nn.Module):
-  def __init__(self, d_model, n_head, dropout, block_size):
+class UnMaskedAttention(nn.Module):
+  def __init__(self, d_model, block_size, dropout, n_head):
     head_size = d_model // n_head
     super().__init__()
-    self.heads = nn.ModuleList([AttentionHead(d_model=d_model, dropout=dropout, head_size=head_size, block_size=block_size) for _ in range(n_head)])
+    self.heads = nn.ModuleList([UnMaskedHead(d_model=d_model, dropout=dropout, block_size=block_size, head_size=head_size) for _ in range(n_head)])
     self.proj = nn.Linear(n_head * head_size, d_model)
     self.dropout = nn.Dropout(dropout)
   
-  def forward(self, x, mask):
-    out = torch.cat([h(x, mask=mask) for h in self.heads], dim=-1)
+  def forward(self, x):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
+    out = self.dropout(self.proj(out))
+    return out
+
+class MaskedHead(nn.Module):
+  def __init__(self, d_model, head_size, dropout, block_size):
+    super().__init__()
+    self.key = nn.Linear(d_model, head_size, bias=False)
+    self.query = nn.Linear(d_model, head_size, bias=False)
+    self.value = nn.Linear(d_model, head_size, bias=False)
+    self.dropout = nn.Dropout(dropout)
+    self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+  def forward(self, x):
+    B, T, C = x.shape
+    key = self.key(x)
+    query = self.query(x)
+    
+    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** -0.5)
+    scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+
+    att_mat = F.softmax(scores, dim=-1)
+    att_mat = self.dropout(att_mat)
+    value = self.value(x)
+    output = torch.matmul(att_mat, value)
+    return output
+
+class CasualMaskedAttention(nn.Module):
+  def __init__(self, d_model, block_size, dropout, n_head):
+    head_size = d_model // n_head
+    super().__init__()
+    self.heads = nn.ModuleList([MaskedHead(d_model=d_model, dropout=dropout, block_size=block_size, head_size=head_size) for _ in range(n_head)])
+    self.proj = nn.Linear(n_head * head_size, d_model)
+    self.dropout = nn.Dropout(dropout)
+  
+  def forward(self, x):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
+    out = self.dropout(self.proj(out))
+    return out
+
+class FinalHead(nn.Module):
+  def __init__(self, d_model, head_size, dropout, block_size):
+    super().__init__()
+    self.key = nn.Linear(d_model, head_size, bias=True)
+    self.query = nn.Linear(d_model, head_size, bias=True)
+    self.value = nn.Linear(d_model, head_size, bias=True)
+    self.dropout = nn.Dropout(dropout)
+
+  def forward(self, x, att):
+    B, T, C = x.shape
+    key = self.key(att)
+    query = self.query(att)
+
+    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** -0.5)
+    rel_pos_scores = torch.einsum('btc,tvc->btv', query, self.rel_pos_embd[:T, :T])
+    scores = scores + rel_pos_scores
+
+    att_mat = F.softmax(scores, dim=-1)
+    att_mat = self.dropout(att_mat)
+    value = self.value(x)
+    output = torch.matmul(att_mat, value)
+    return output
+
+class FinalAttention(nn.Module):
+  def __init__(self, d_model, block_size, dropout, n_head):
+    head_size = d_model // n_head
+    super().__init__()
+    self.heads = nn.ModuleList([FinalHead(d_model=d_model, dropout=dropout, block_size=block_size, head_size=head_size) for _ in range(n_head)])
+    self.proj = nn.Linear(n_head * head_size, d_model)
+    self.dropout = nn.Dropout(dropout)
+  
+  def forward(self, x):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
     out = self.dropout(self.proj(out))
     return out
 
@@ -124,63 +117,59 @@ class FeedForward(nn.Module):
   def __init__(self, d_model, dropout):
     super().__init__()
     self.net = nn.Sequential(
-      nn.Linear(d_model, 4*d_model),
+      nn.Linear(d_model, 10*d_model),
       nn.GELU(),
-      nn.Linear(4*d_model, d_model),
+      nn.Linear(10*d_model, d_model),
       nn.Dropout(dropout)
     )
-   
+
   def forward(self, x):
     return self.net(x)
 
 class EncoderNetwork(nn.Module):
   def __init__(self, d_model, n_head, norm_eps, dropout, block_size):
     super().__init__()
-    self.s_att = MultiHeadAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
+    self.s_att = UnMaskedAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
     self.ffwd = FeedForward(d_model, dropout)
     self.dropout = nn.Dropout(dropout)
-    self.norm1 = nn.LayerNorm(d_model, eps=norm_eps)
-    self.norm2 = nn.LayerNorm(d_model, eps=norm_eps)
-  
+    self.norm = nn.LayerNorm(d_model, eps=norm_eps)
+
   def forward(self, src):
-    src2 = self.s_att(src, mask=False)
-    src = src + self.dropout(src2)
-    src = self.norm1(src)
+    src_att = self.s_att(self.norm(src))
+    src_out = src + self.dropout(src_att)
 
-    src2 = self.ffwd(src)
-    src = src + self.dropout(src2)
-    src = self.norm2(src)
+    src = self.ffwd(self.norm(src_out))
+    src_f = src_out + self.dropout(src)
 
-    return src
+    del src_att, src_out, src
+    return src_f
 
 class DecoderNetwork(nn.Module):
   def __init__(self, d_model, n_head, norm_eps, dropout, block_size):
     super().__init__()
-    self.s_att = MultiHeadAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
+    self.m_att = CasualMaskedAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
+    self.f_att = FinalAttention(d_model=d_model, n_head=n_head, dropout=dropout, block_size=block_size)
     self.ffwd = FeedForward(d_model, dropout)
     self.dropout = nn.Dropout(dropout)
-    self.norm1 = nn.LayerNorm(d_model, eps=norm_eps)
-    self.norm2 = nn.LayerNorm(d_model, eps=norm_eps)
-  
-  def forward(self, src, trg):
-    src2 = self.s_att(src, mask=True)
-    src = src + self.dropout(src2)
-    src = src + self.norm1(src)
+    self.norm = nn.LayerNorm(d_model, eps=norm_eps)
 
-    trg2 = self.s_att(trg, mask=False)
-    trg = trg + self.dropout(trg2)
-    trg = trg + self.norm1(trg)
-    
-    src_f = src + trg
-    src_f2 = self.ffwd(self.norm2(src_f))
-    src_f = src_f + self.dropout(src_f2)
-    src_f = self.norm2(src_f)
+  def forward(self, src, att):
+    m_att_out = self.m_att(self.norm(src))
+    m_out = src + self.dropout(m_att_out)
 
+    f_out = self.f_att(self.norm(m_out), self.norm(att))
+    f_out = m_out + self.dropout(f_out)
+
+    src_f = self.ffwd(self.norm(f_out))
+    src_f = f_out + self.dropout(src_f)
+
+    del f_out, m_out, m_att_out, src, att
     return src_f
 
 class Transformer(nn.Module):
-  def __init__(self):
+  def __init__(self, vocab_size, n_head, block_size, d_model, n_layers, norm_eps, dropout):
     super().__init__()
+    self.block_size = block_size
     self.toked_model = nn.Embedding(vocab_size, d_model)
     self.pos_encod = nn.Embedding(block_size, d_model)
     self.enc_layer = nn.ModuleList([EncoderNetwork(n_head=n_head, norm_eps=norm_eps, block_size=block_size, dropout=dropout, d_model=d_model) for _ in range(n_layers)])
@@ -192,45 +181,74 @@ class Transformer(nn.Module):
     self.apply(self._init_weights)
 
   def _init_weights(self, module):
+    """
+      initialize weights of linear and embedding layers
+
+      Args:
+        - module (nn.Module): the module to initialize weights for
+    """
     if isinstance(module, nn.Linear):
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
       if module.bias is not None:
         torch.nn.init.zeros_(module.bias.data)
     elif isinstance(module, nn.Embedding):
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    
+
   def forward(self, idx, targets=None):
+    """
+      forward pass of the transformer model
+
+    Args:
+      - idx (Tensor): input tensor representing token indices
+      - targets (Tensor): target tensor for computing loss during training
+
+    Returns:
+      - logits (Tensor): output logits from the final linear layer
+      - loss (Tensor): optional. computed cross-entropy loss if targets are provided, else None
+    """
     B, T = idx.shape
 
     toked_model = self.toked_model(idx)
     pos_encod = self.pos_encod(torch.arange(T, device=device))
-    x_in = toked_model + pos_encod
+    x = toked_model + pos_encod
 
     for layer in self.enc_layer:
-      x_out = layer(x_in)
+      x_out = layer(x)
 
     for layer in self.dec_layer:
-      x = layer(x_in, x_out)
+      x_final = layer(x, x_out)
 
-    x = self.norm_final(x)
-    logits = self.linear_final(x)
+    x_final = self.norm_final(x_final)
+    logits = self.linear_final(x_final)
 
     if targets is None:
       loss = None
-    
+
     else:
       B, T, C = logits.shape
       logits = logits.view(B*T, C)
       targets = targets.view(B*T)
       loss = F.cross_entropy(logits, targets)
-    
+
     return logits, loss
-  
+
   def generate(self, idx, max_new_tokens, temperature=1.0, top_k=0):
+    """
+      generate new tokens using the trained model
+
+    Args:
+      - idx (Tensor): input tensor representing initial token indices
+      - max_new_tokens (int): max no of new tokens to generate
+      - temperature (float): softmax temperature for sampling
+      - top_k (int): no of top tokens to consider in sampling
+
+    Returns:
+      - generated_tokens (list): list of generated token indices
+    """
     generated_tokens = []
 
     for _ in range(max_new_tokens):
-      idx_cond = idx[:, -block_size:]
+      idx_cond = idx[:, -self.block_size:]
       logits, _ = self(idx_cond)
       logits = logits[:, -1, :]
 
@@ -244,39 +262,61 @@ class Transformer(nn.Module):
       idx = torch.cat((idx, sampled_idx), dim=1)
 
     return generated_tokens
+  
+  def generate_masked_tokens(self, idx, masked_indices, temperature=1.0, top_k=0):
+    """
+      Generate predictions for masked tokens using the trained model.
 
+      Args:
+        - idx (Tensor): input tensor representing token indices
+        - masked_indices (Tensor): tensor of indices indicating masked positions
+        - temperature (float): softmax temperature for sampling
+        - top_k (int): no of top tokens to consider in sampling
 
+      Returns:
+        - predicted_tokens (Tensor): tensor of predicted token indices
+    """
+    B, T = idx.shape
+
+    toked_model = self.toked_model(idx)
+    pos_encod = self.pos_encod(torch.arange(T, device=device))
+    x = toked_model + pos_encod
+
+    for layer in self.enc_layer:
+      x_out = layer(x)
+
+    for layer in self.dec_layer:
+      x_final = layer(x, x_out)
+
+    x_masked = x_final.clone()
+    x_masked[masked_indices] = self.toked_model(torch.tensor([6], device=device))
+
+    x_masked = self.norm_final(x_masked)
+    logits = self.linear_final(x_masked)
+
+    masked_logits = logits[masked_indices].view(-1, logits.size(-1))
+    scaled_logits = masked_logits / temperature
+    if top_k > 0:
+      scaled_logits = self._top_k_filtering(scaled_logits, top_k)
+
+    probs = F.softmax(scaled_logits, dim=-1)
+    predicted_indices = torch.argmax(probs, dim=-1)
+
+    return predicted_indices
+  
   def _top_k_filtering(self, logits, top_k):
+    """
+      filter logits to keep only the top-k tokens
+
+    Args:
+      - logits (Tensor): input tensor representing unscaled logits
+      - top_k (int): no of top tokens to keep
+
+    Returns:
+      - filtered_logits (Tensor): filtered logits with only top-k tokens remaining
+    """
     values, indices = torch.topk(logits, top_k, dim=-1)
     min_value = values[:, -1].unsqueeze(-1).expand_as(logits)
     filtered_logits = torch.where(logits < min_value, torch.ones_like(logits) * -float('inf'), logits)
+
     return filtered_logits
-
-model = Transformer()
-m = model.to(device)
-
-# no of parameters
-n_param = sum(p.numel() for p in m.parameters())/1e6
-print(f"{n_param:.2f} million")
-
-# optimizer
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-steps = []
-train_losses = []
-val_losses = []
-
-for iter in range(max_iters):
-
-  if iter % eval_interval == 0 or iter == max_iters - 1:
-    losses = estimate_loss()
-    print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-    steps.append(iter)
-    train_losses.append(losses['train'])
-    val_losses.append(losses['val'])
-
-  xb, yb = get_batch('train')
-  logits, loss = model(xb, yb)
-  optimizer.zero_grad(set_to_none=True)
-  loss.backward()
-  optimizer.step()
