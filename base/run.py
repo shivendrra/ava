@@ -40,9 +40,9 @@ with open('config.json', 'r', encoding='utf-8') as file:
 # required parameters
 batch_size = params['batch_size']
 block_size = params['block_size']
-max_iters = params['max_iters']
-eval_interval = params['eval_interval']
-eval_iters = params['eval_iters']
+max_iters = 1000
+eval_interval = 100
+eval_iters = 200
 learning_rate = params['learning_rate']
 
 torch.manual_seed(1400)
