@@ -1,4 +1,5 @@
 # AIVA-4x500M
+![aiva](https://liketowatchblog.files.wordpress.com/2015/10/ex-machina-ava-dress.jpg)
 
 ## Introduction
 Building Ava from Ex-Machina using Language model paired with vision and audio engines. Using MoE to generated and understand speech, and then using vision models to identify and see physical things, this would work like a near human robot(less bot type and more human type)
