@@ -164,7 +164,7 @@ class Transformer(nn.Module):
     self.block_size = block_size
     self.token_embeddings = nn.Embedding(vocab_size, d_model)
     self.pos_encodings = nn.Embedding(block_size, d_model)
-    self.decoder = nn.ModuleList([DecoderBlock(n_head=n_head, d_model=d_model, dropout=dropout, norm_eps=norm_eps, block_size=block_size) for _ in range(n_layers)])
+    self.decoder = nn.Sequential(*[DecoderBlock(n_head=n_head, d_model=d_model, dropout=dropout, norm_eps=norm_eps, block_size=block_size) for _ in range(n_layers)])
     self.norm_final = RMSNorm(d_model, eps=norm_eps)
     self.linear_final = nn.Linear(d_model, vocab_size)
     self.dropout = nn.Dropout(dropout)
