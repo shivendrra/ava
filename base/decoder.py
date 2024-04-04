@@ -51,7 +51,8 @@ class MaskedHead(nn.Module):
     if mask is True:
       scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
 
-    att_mat = F.softmax(scores)
+    att_mat = F.softmax(scores, dim=-1)
+    att_mat = self.dropout(att_mat)
     value = self.value(x)
     output = torch.matmul(att_mat, value)
     return output
@@ -78,7 +79,8 @@ class UnMaskedHead(nn.Module):
     rel_pos_scores = torch.einsum('btc,tvc->btv', query, self.rel_pos_embd[:T, :T])
     scores = scores + rel_pos_scores
 
-    att_mat = F.softmax(scores)
+    att_mat = F.softmax(scores, dim=-1)
+    att_mat = self.dropout(att_mat)
     value = self.value(x)
     output = torch.matmul(att_mat, value)
     return output
