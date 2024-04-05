@@ -42,14 +42,13 @@ class MaskedHead(nn.Module):
     self.dropout = nn.Dropout(dropout)
     self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
   
-  def forward(self, x: torch.Tensor, mask: bool = False):
+  def forward(self, x: torch.Tensor):
     B, T, C = x.shape
     key = self.key(x)
     query = self.query(x)
     scores = torch.matmul(query ,key.transpose(-2, -1)) / (key.shape[-1]**-0.5)
     
-    if mask is True:
-      scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+    scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
 
     att_mat = F.softmax(scores, dim=-1)
     att_mat = self.dropout(att_mat)
@@ -70,7 +69,7 @@ class UnMaskedHead(nn.Module):
     self.dropout = nn.Dropout(dropout)
     self.rel_pos_embd = nn.Parameter(torch.randn(block_size, block_size, head_size))
   
-  def forward(self, x: torch.Tensor, mask: bool = False):
+  def forward(self, x: torch.Tensor):
     B, T, C = x.shape
     key = self.key(x)
     query = self.query(x)
@@ -97,8 +96,8 @@ class MaskedAttention(nn.Module):
     self.projection = nn.Linear(d_model, d_model)
     self.dropout = nn.Dropout(dropout)
   
-  def forward(self, x: torch.Tensor, mask: bool = False):
-    out = torch.cat([h(x, mask) for h in self.heads], dim=-1)
+  def forward(self, x: torch.Tensor):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
     out = self.dropout(self.projection(out))
     return out
 
@@ -114,18 +113,21 @@ class UnMaskedAttention(nn.Module):
     self.projection = nn.Linear(d_model, d_model)
     self.dropout = nn.Dropout(dropout)
   
-  def forward(self, x: torch.Tensor, mask: bool = False):
-    out = torch.cat([h(x, mask) for h in self.heads], dim=-1)
+  def forward(self, x: torch.Tensor):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
     out = self.dropout(self.projection(out))
     return out
 
 class FeedForward(nn.Module):
-  def __init__(self, n_embd, dropout):
+  def __init__(self, d_model, dropout):
     super().__init__()
     self.net = nn.Sequential(
-      nn.Linear(n_embd, 5 * n_embd),
+      nn.Linear(d_model, 5 * d_model),
       nn.GELU(),
-      nn.Linear(5 * n_embd, n_embd),
+      nn.Linear(5 * d_model, 5 * d_model),
+      nn.Dropout(dropout),
+      nn.GELU(),
+      nn.Linear(5 * d_model, d_model),
       nn.Dropout(dropout),
       )
 
@@ -146,11 +148,11 @@ class DecoderBlock(nn.Module):
     self.norm = RMSNorm(d_model, eps=norm_eps)
   
   def forward(self, x: torch.Tensor):
-    x_out = self.m_att(self.norm(x), mask=True)
+    x_out = self.m_att(self.norm(x))
     x_out = x + self.dropout(x_out)
     del x
 
-    x = self.um_att(self.norm(x_out), mask=False)
+    x = self.um_att(self.norm(x_out))
     x = x_out + self.dropout(x)
     del x_out
 
@@ -186,7 +188,8 @@ class Transformer(nn.Module):
     pos_encod = self.pos_encodings(torch.arange(T, device=device))
     x = toked_model + pos_encod
     
-    logits = self.linear_final(self.norm_final(self.decoder(x)))
+    x = self.decoder(x)
+    logits = self.linear_final(self.norm_final(x))
 
     if targets is None:
       loss = None
