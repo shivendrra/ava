@@ -21,7 +21,7 @@ class RMSNorm(nn.Module):
     super().__init__()
     self.eps = eps
     self.weight = nn.Parameter(torch.ones(dim))
-    
+
   def _norm(self, x):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
@@ -29,34 +29,7 @@ class RMSNorm(nn.Module):
     output = self._norm(x.float()).type_as(x)
     return output * self.weight
 
-class MaskedHead(nn.Module):
-  def __init__(self,
-      head_size: int,
-      d_model: int,
-      block_size: int,
-      dropout: float):
-    super().__init__()
-    self.key = nn.Linear(d_model, head_size, bias=True)
-    self.query = nn.Linear(d_model, head_size, bias=True)
-    self.value = nn.Linear(d_model, head_size, bias=True)
-    self.dropout = nn.Dropout(dropout)
-    self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-  
-  def forward(self, x: torch.Tensor):
-    B, T, C = x.shape
-    key = self.key(x)
-    query = self.query(x)
-    scores = torch.matmul(query ,key.transpose(-2, -1)) / (key.shape[-1]**-0.5)
-    
-    scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-
-    att_mat = F.softmax(scores, dim=-1)
-    att_mat = self.dropout(att_mat)
-    value = self.value(x)
-    output = torch.matmul(att_mat, value)
-    return output
-
-class UnMaskedHead(nn.Module):
+class SingleHead(nn.Module):
   def __init__(self,
       head_size: int,
       d_model: int,
@@ -68,23 +41,27 @@ class UnMaskedHead(nn.Module):
     self.value = nn.Linear(d_model, head_size, bias=True)
     self.dropout = nn.Dropout(dropout)
     self.rel_pos_embd = nn.Parameter(torch.randn(block_size, block_size, head_size))
-  
-  def forward(self, x: torch.Tensor):
+    self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+  def forward(self, x: torch.Tensor, mask: bool= False):
     B, T, C = x.shape
     key = self.key(x)
     query = self.query(x)
     scores = torch.matmul(query ,key.transpose(-2, -1)) / (key.shape[-1]**-0.5)
-        
     rel_pos_scores = torch.einsum('btc,tvc->btv', query, self.rel_pos_embd[:T, :T])
     scores = scores + rel_pos_scores
+
+    if mask is True:
+      scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
 
     att_mat = F.softmax(scores, dim=-1)
     att_mat = self.dropout(att_mat)
     value = self.value(x)
     output = torch.matmul(att_mat, value)
+
     return output
 
-class MaskedAttention(nn.Module):
+class MultiHeadAttention(nn.Module):
   def __init__(self,
       d_model: int,
       block_size: int,
@@ -92,30 +69,15 @@ class MaskedAttention(nn.Module):
       dropout: float):
     head_size = d_model // n_head
     super().__init__()
-    self.heads = nn.ModuleList([MaskedHead(d_model=d_model, dropout=dropout, block_size=block_size, head_size=head_size) for _ in range(n_head)])
-    self.projection = nn.Linear(d_model, d_model)
+    self.heads = nn.ModuleList([SingleHead(d_model=d_model, dropout=dropout, block_size=block_size, head_size=head_size) for _ in range(n_head)])
+    self.projection = nn.Linear(head_size * n_head, d_model)
     self.dropout = nn.Dropout(dropout)
-  
-  def forward(self, x: torch.Tensor):
-    out = torch.cat([h(x) for h in self.heads], dim=-1)
-    out = self.dropout(self.projection(out))
-    return out
 
-class UnMaskedAttention(nn.Module):
-  def __init__(self,
-      d_model: int,
-      block_size: int,
-      n_head : int,
-      dropout: float):
-    head_size = d_model // n_head
-    super().__init__()
-    self.heads = nn.ModuleList([UnMaskedHead(d_model=d_model, dropout=dropout, block_size=block_size, head_size=head_size) for _ in range(n_head)])
-    self.projection = nn.Linear(d_model, d_model)
-    self.dropout = nn.Dropout(dropout)
-  
-  def forward(self, x: torch.Tensor):
-    out = torch.cat([h(x) for h in self.heads], dim=-1)
+  def forward(self, x: torch.Tensor, mask: bool):
+    out = torch.cat([h(x, mask) for h in self.heads], dim=-1)
     out = self.dropout(self.projection(out))
+
+    del x
     return out
 
 class FeedForward(nn.Module):
@@ -123,9 +85,6 @@ class FeedForward(nn.Module):
     super().__init__()
     self.net = nn.Sequential(
       nn.Linear(d_model, 5 * d_model),
-      nn.GELU(),
-      nn.Linear(5 * d_model, 5 * d_model),
-      nn.Dropout(dropout),
       nn.GELU(),
       nn.Linear(5 * d_model, d_model),
       nn.Dropout(dropout),
@@ -141,39 +100,37 @@ class DecoderBlock(nn.Module):
         norm_eps: float,
         dropout: float):
     super().__init__()
-    self.m_att = MaskedAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
-    self.um_att = UnMaskedAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
+    self.self_att = MultiHeadAttention(n_head=n_head, d_model=d_model, dropout=dropout, block_size=block_size)
     self.ffwd = FeedForward(d_model, dropout)
     self.dropout = nn.Dropout(dropout)
     self.norm = RMSNorm(d_model, eps=norm_eps)
-  
+
   def forward(self, x: torch.Tensor):
-    x_out = self.m_att(self.norm(x))
+    x_out = self.self_att(self.norm(x), mask=True)
     x_out = x + self.dropout(x_out)
     del x
 
-    x = self.um_att(self.norm(x_out))
+    x = self.self_att(self.norm(x_out), mask=False)
     x = x_out + self.dropout(x)
     del x_out
 
     x_out = self.ffwd(self.norm(x))
     x_out = x + self.dropout(x_out)
     del x
-    
+
     return x_out
-  
+
 class Transformer(nn.Module):
   def __init__(self, vocab_size: int):
     super().__init__()
     self.block_size = block_size
     self.token_embeddings = nn.Embedding(vocab_size, d_model)
-    self.pos_encodings = nn.Embedding(block_size, d_model)
     self.decoder = nn.Sequential(*[DecoderBlock(n_head=n_head, d_model=d_model, dropout=dropout, norm_eps=norm_eps, block_size=block_size) for _ in range(n_layers)])
     self.norm_final = RMSNorm(d_model, eps=norm_eps)
     self.linear_final = nn.Linear(d_model, vocab_size)
     self.dropout = nn.Dropout(dropout)
     self.apply(self._init_weights)
-  
+
   def _init_weights(self, module):
     if isinstance(module, nn.Linear):
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -181,13 +138,10 @@ class Transformer(nn.Module):
         torch.nn.init.zeros_(module.bias.data)
     elif isinstance(module, nn.Embedding):
       torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    
+
   def forward(self, idx, targets=None):
     B, T = idx.shape
-    toked_model = self.token_embeddings(idx)
-    pos_encod = self.pos_encodings(torch.arange(T, device=device))
-    x = toked_model + pos_encod
-    
+    x = self.token_embeddings(idx)
     x = self.decoder(x)
     logits = self.linear_final(self.norm_final(x))
 
@@ -202,12 +156,21 @@ class Transformer(nn.Module):
 
     return logits, loss
 
-  def generate(self, idx: torch.Tensor, max_token: int=10):
-    for _ in range(max_token):
-      idx_cond = idx[:, -self.block_size:]
-      logits = self(idx_cond)
-      logits = logits[:, -1, :]
+  @torch.no_grad()
+  def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    self.eval()
+    for _ in range(max_new_tokens):
+
+      idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+      logits, _ = self(idx_cond)
+      logits = logits[:, -1, :] / temperature
+
+      if top_k is not None:
+        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+        logits[logits < v[:, [-1]]] = -float('Inf')
+
       probs = F.softmax(logits, dim=-1)
-      idx_next = torch.argmax(probs, dim=-1)
+      idx_next = torch.multinomial(probs, num_samples=1)
       idx = torch.cat((idx, idx_next), dim=1)
+
     return idx
