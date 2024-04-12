@@ -69,6 +69,7 @@ class PositionalEncoding(nn.Module):
 class NewGELU(nn.Module):
   def forward(self, input):
     return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+
 class SelfAttention(nn.Module):
   def __init__(self, head_size, d_model, block_size, dropout):
     super().__init__()
@@ -187,7 +188,7 @@ class Transformer(nn.Module):
   def __init__(self, vocab_size, config: ConfigModel):
     super().__init__()
     self.block_size = config.block_size
-    self.toked_model = nn.Embedding(vocab_size, config.d_model)
+    self.tok_embedd = nn.Embedding(vocab_size, config.d_model)
     self.pos_encod = nn.Embedding(self.block_size, config.d_model)
     self.aud_pos = PositionalEncoding(config.d_model, self.block_size, config.dropout)
     self.encoder = nn.ModuleList([Encoder(config.d_model, self.block_size, config.n_head, config.dropout, config.n_ff, config.norm_eps) for _ in range(config.n_layers)])
@@ -199,9 +200,9 @@ class Transformer(nn.Module):
   def forward(self, aud_in, txt_in):
     B, T = txt_in.shape
     
-    toked_model = self.toked_model(txt_in)
+    tok_embd = self.tok_embedd(txt_in)
     pos_encod = self.pos_encod(torch.arange(T, device=device))
-    x = toked_model + pos_encod
+    x = tok_embd + pos_encod
 
     aud_tok = self.aud_pos(aud_in)
 
