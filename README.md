@@ -15,7 +15,7 @@ Transformer based model, means it has both, encoder and decoder. It uses few new
 It uses SWIN transformer trained to identify faces in a video and check whether a person is speaking or not. It does have CCT, CVT and ViT codes too, but didn't train them. For now it's still work in progress but soon it'll be done.
 
 ## Audio Engine
-Work in progress
+A transformer based model same as OpenAI's Whisper model, not yet test but it should work. I hope so!
 
 ## Contribution
 Pull requests are welcome. For major changes, please open an issue first to discuss what you would like to change.
