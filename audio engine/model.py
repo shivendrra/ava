@@ -6,13 +6,13 @@ import math
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 class ConfigModel():
-  d_model = 512
-  block_size = 256
-  n_head = 18
+  d_model = 768
+  block_size = 1024
+  n_head = 12
   n_layers = 12
   dropout = 0.2
   norm_eps = 1e-5
-  n_ff = 5 * d_model
+  n_ff = 4 * d_model
 
 class RMSNorm(nn.Module):
   def __init__(self, dim: int, eps: float = 1e-6):
