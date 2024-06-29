@@ -1,11 +1,13 @@
 import torch
-import torch.nn as nn
+from torch import Tensor, nn
 import torch.nn.functional as F
 import math
+from typing import Dict, Iterable, Optional
+import numpy as np
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-class ConfigModel():
+class ConfigModel:
   d_model = 768
   block_size = 1024
   n_head = 12
@@ -50,6 +52,32 @@ class RMSNorm(nn.Module):
     output = self._norm(x.float()).type_as(x)
     return output * self.weight
 
+class Linear(nn.Linear):
+  def forward(self, x: Tensor) -> Tensor:
+    return F.linear(
+      x,
+      self.weight.to(x.dtype),
+      None if self.bias is None else self.bias.to(x.dtype),
+    )
+
+class Conv1d(nn.Conv1d):
+  def _conv_forward(self, x: Tensor, weight: Tensor, bias: Optional[Tensor]) -> Tensor:
+    return super()._conv_forward(
+      x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+    )
+
+def sinusoids(length, channels, max_timescale=10000):
+  """Returns sinusoids for positional embedding"""
+  assert channels % 2 == 0
+  log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
+  inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
+  scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
+  return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
+
+class NewGELU(nn.Module):
+  def forward(self, input):
+    return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+
 class PositionalEncoding(nn.Module):
   def __init__(self, d_model, block_size, dropout):
     super().__init__()
@@ -65,10 +93,6 @@ class PositionalEncoding(nn.Module):
   def forward(self, x):
     x = x + self.pe[:x.size(0), :]
     return self.dropout(x)
-
-class NewGELU(nn.Module):
-  def forward(self, input):
-    return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 
 class SelfAttention(nn.Module):
   def __init__(self, head_size, d_model, block_size, dropout):
