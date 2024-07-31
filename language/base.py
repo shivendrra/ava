@@ -2,7 +2,6 @@ import json
 with open('config.json', 'r', encoding='utf-8') as file:
   params = json.load(file)
 
-# required parameters
 block_size = params['block_size']
 d_model = params['d_model']
 n_head = params['n_heads']
