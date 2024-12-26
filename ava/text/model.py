@@ -6,7 +6,12 @@ class ModelArgs:
   d_model:int = 1024
   n_layers:int = 12
   n_heads:int = 18
-  n_ff:int = 10 * d_model
+  n_ff_multiple:int = 10
+  fnn_multiplier:int = None
+  n_ff:int = n_ff_multiple * d_model
+  dropout:float = 0.2
+  norm_eps:float = 1e-5
+  block_size:int = 1024
 
 class RMSNorm(nn.Module):
   def __init__(self, dim:int, eps:float=1e-5):
@@ -32,40 +37,66 @@ class SwiGLU(nn.Module):
     x2 = F.linear(x, self.w2.weight)
     return F.silu(x1) * x2
 
-class Attention(nn.Module):
-  def __init__(self, head_size:int, d_model:int, block_size:int, dropout:float, bias:bool, masking:bool):
+class RoPE(nn.Module):
+  def __init__(self, head_size, block_size):
     super().__init__()
-    self.key = nn.Linear(d_model, head_size, bias=bias)
-    self.query = nn.Linear(d_model, head_size, bias=bias)
-    self.value = nn.Linear(d_model, head_size, bias=bias)
-    self.dropout = dropout
-    self.relpos_embed = nn.Parameter(torch.randn(block_size, block_size, head_size))
-    if masking:
-      self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-      self.masking = True
-    else: self.masking = False
+    self.head_size = head_size
+    self.block_size = block_size
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_size, 2).float() / head_size))
+    position = torch.arange(0, block_size, dtype=torch.float).unsqueeze(1)  # (block_size, 1)
+    sinusoidal = torch.einsum("i,j->ij", position, inv_freq)  # Shape: (block_size, head_size // 2)
+    self.register_buffer("cos_emb", sinusoidal.cos(), persistent=False)  # (block_size, head_size // 2)
+    self.register_buffer("sin_emb", sinusoidal.sin(), persistent=False)  # (block_size, head_size // 2)
+
+  def forward(self, q, k):
+    # spliting tensors into even and odd components
+    q1, q2 = q[..., ::2], q[..., 1::2]
+    k1, k2 = k[..., ::2], k[..., 1::2]
+
+    # retrieving embeddings for current sequence length
+    cos = self.cos_emb[:q.shape[1], :].unsqueeze(0).to(q.device)
+    sin = self.sin_emb[:q.shape[1], :].unsqueeze(0).to(q.device)
+
+    # applying rotations
+    q_rot = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
+    k_rot = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
+    return q_rot, k_rot
+
+class Head(nn.Module):
+  def __init__(self, head_size, d_model, dropout, block_size, mask=False):
+    super().__init__()
+    self.key = nn.Linear(d_model, head_size, bias=True)
+    self.query = nn.Linear(d_model, head_size, bias=True)
+    self.value = nn.Linear(d_model, head_size, bias=True)
+    self.dropout = nn.Dropout(dropout)
+    self.mask = mask
+    if mask:
+      self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+    self.pos_emb = RoPE(head_size, block_size)
   def forward(self, x):
     B, T, C = x.shape
     key, query, value = self.key(x), self.query(x), self.value(x)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** -0.5)
-    if self.masking:
-      scores = scores.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-    relpos_scores = torch.einsum('btc,tvc->btv', query, self.relpos_embed[:T, :T])
-    scores = scores + relpos_scores
-    output = F.softmax(scores, dim=-1)
-    output = self.dropout(output)
-    return output @ value
+    query, key = self.pos_emb(query, key)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** 0.5)
+    if self.mask:
+      scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+    attention = self.dropout(F.softmax(scores, dim=-1))
+    output = torch.matmul(attention, value)
+    return output
 
 class MultiHeadAttention(nn.Module):
-  def __init__(self, d_model:int, block_size:int, dropout:float, n_head:int, bias:bool, masking:bool):
+  def __init__(self, d_model, dropout, n_head, block_size, mask):
     head_size = d_model // n_head
     super().__init__()
-    self.heads = nn.ModuleList([Attention(head_size, d_model, block_size, dropout, bias, masking)])
-    self.projection = nn.Linear(n_head * head_size, d_model)
+    self.heads = nn.ModuleList(
+      [Head(head_size, d_model, dropout, block_size, mask) for _ in range(n_head)]
+    )
+    self.proj = nn.Linear(n_head * head_size, d_model)
     self.dropout = nn.Dropout(dropout)
   def forward(self, x):
     out = torch.cat([h(x) for h in self.heads], dim=-1)
-    return self.dropout(self.projection(out))
+    out = self.dropout(self.proj(out))
+    return out
 
 class FeedForward(nn.Module):
   def __init__(self, d_model, hidden_dim, multiple_of, ffn_multiplier, dropout) -> None:
@@ -101,11 +132,47 @@ class Decoder(nn.Module):
     x = x + self.dropout(self.ffwd(x_out))
     return x
 
-class PositionalEncodings(nn.Module):
-  def __init__(self,):
-    super().__init__()
-
 class Transformer(nn.Module):
-  def __init__(self, params:ModelArgs, vocab_size):
+  def __init__(self, params: ModelArgs, vocab_size: int):
     super().__init__()
-    self.token_embeddings = nn.Embedding()
+    self.block_size = params.block_size
+    self.d_model = params.d_model
+    self.n_layers = params.n_layers
+    self.token_embeddings = nn.Embedding(vocab_size, self.d_model)
+    self.positional_embeddings = nn.Embedding(self.block_size, self.d_model)
+    self.decoder_layers = nn.ModuleList([Decoder(d_model=params.d_model, n_head=params.n_heads, norm_eps=params.norm_eps, dropout=params.dropout, block_size=params.block_size, hidden_dim=params.n_ff, multiple_of=params.n_ff_multiple, ffn_multiplier=params.ffn_multiplier) for _ in range(self.n_layers)])
+    self.norm_final = RMSNorm(self.d_model, params.norm_eps)
+    self.linear_final = nn.Linear(self.d_model, vocab_size, bias=False)
+    self.apply(self._init_weights)
+
+  def _init_weights(self, module):
+    if isinstance(module, nn.Linear):
+      torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+      if module.bias is not None:
+        torch.nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+      torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+  def forward(self, idx, targets=None):
+    B, T = idx.size()
+    token_embeddings = self.token_embeddings(idx)  # Shape: (B, T, d_model)
+    pos_indices = torch.arange(T, device=idx.device).unsqueeze(0)  # Shape: (1, T)
+    positional_embeddings = self.positional_embeddings(pos_indices)  # Shape: (1, T, d_model)
+    x = token_embeddings + positional_embeddings  # Shape: (B, T, d_model)
+
+    # through decoder layers
+    for layer in self.decoder_layers:
+      x = layer(x)
+
+    # final normalization and projection
+    x = self.norm_final(x)
+    logits = self.linear_final(x)  # Shape: (B, T, vocab_size)
+
+    # compute loss if targets are there
+    loss = None
+    if targets is not None:
+      B, T, C = logits.shape
+      logits = logits.view(B * T, C)
+      targets = targets.view(B * T)
+      loss = F.cross_entropy(logits, targets)
+    return logits, loss
