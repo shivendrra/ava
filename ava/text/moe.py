@@ -160,12 +160,12 @@ class SparseMoE(nn.Module):
       expert_mask = (indices == i).any(dim=-1)
       flat_mask = expert_mask.view(-1)
       selected_indices = torch.nonzero(flat_mask).squeeze(-1)
-      limited_indices = selected_outputs[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
+      limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
       if limited_indices.numel() > 0:
-        expert_indices = flat_x[limited_indices]
-        expert_output = expert(expert_input)
+        expert_inputs = flat_x[limited_indices]
+        expert_output = expert(expert_inputs)
         gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
-        weighted_output = expert_output * gating_scores
+        weighted_outputs = expert_output * gating_scores
         updates.index_add_(0, limited_indices, weighted_outputs)
 
     final_outputs += updates.view(batch_size, seq_len, -1)
@@ -183,33 +183,24 @@ class Block(nn.Modules):
     x = x + self.smoe(self.ln2(x))
     return x
 
-class Transformer(nn.Module):
+def kaiming_init_weights(m):
+  if isinstance (m, (nn.Linear)): nn.init.kaiming_normal_(m.weight)
+
+class TransformerMoE(nn.Module):
   def __init__(self, params: ModelArgs, vocab_size: int):
     super().__init__()
     self.block_size = params.block_size
     self.d_model = params.d_model
     self.n_layers = params.n_layers
     self.token_embeddings = nn.Embedding(vocab_size, self.d_model)
-    self.positional_embeddings = RoPE(self.d_model, self.block_size)
     self.blocks = nn.ModuleList([Block(d_model=params.d_model, n_head=params.n_heads, n_experts=params.n_experts, top_k=params.top_k, dropout=params.dropout, block_size=params.block_size) for _ in range(self.n_layers)])
     self.norm_final = RMSNorm(self.d_model, params.norm_eps)
     self.linear_final = nn.Linear(self.d_model, vocab_size, bias=False)
-    self.apply(self._init_weights)
-
-  def _init_weights(self, module):
-    if isinstance(module, nn.Linear):
-      torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-      if module.bias is not None:
-        torch.nn.init.zeros_(module.bias)
-    elif isinstance(module, nn.Embedding):
-      torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    self.apply(kaiming_init_weights)
 
   def forward(self, idx, targets=None):
     B, T = idx.size()
-    token_embeddings = self.token_embeddings(idx)  # Shape: (B, T, d_model)
-    positional_embeddings = self.positional_embeddings(pos_indices).to(idx.device)
-    x = token_embeddings + positional_embeddings  # Shape: (B, T, d_model)
-
+    x = self.token_embeddings(idx)  # Shape: (B, T, d_model)
     # through decoder layers
     for layer in self.blocks:
       x = layer(x)

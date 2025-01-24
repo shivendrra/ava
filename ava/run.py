@@ -60,8 +60,8 @@ def estimate_loss():
   model.train()
   return out
 
-from .text.model import Transformer
-model = Transformer(vocab_size)
+from .text.moe import TransformerMoE
+model = TransformerMoE(vocab_size)
 m = model.to(device)
 
 n_param = sum(p.numel() for p in m.parameters())/1e6

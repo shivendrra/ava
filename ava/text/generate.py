@@ -19,8 +19,8 @@ from .tokenizer import Tokenizer
 tokenizer = Tokenizer()
 vocab_size = tokenizer.get_vocab()
 
-from .model import Transformer
-model = Transformer(vocab_size)
+from .moe import TransformerMoE
+model = TransformerMoE(vocab_size)
 checkpoint_path = '/content/drive/MyDrive/base-500m.pth'
 checkpoint = torch.load(checkpoint_path)
 model.load_state_dict(checkpoint)
