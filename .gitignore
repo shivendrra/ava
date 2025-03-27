@@ -5,6 +5,7 @@ __pycache__/
 test data/
 
 dataset/
+ava/model/
 
 # Distribution / packaging
 .Python
