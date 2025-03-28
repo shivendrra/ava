@@ -32,7 +32,7 @@ class SwiGLU(nn.Module):
       SwiGLU(x,W,V,b,c,b) = Swish b(xW + b) * (xV + c)
     paper: https://paperswithcode.com/method/swiglu
   """
-  def __init__(self, w1:torch.tensor, w2:torch.tensor, w3:torch.tensor) -> None:
+  def __init__(self, w1:torch.tensor, w2:torch.tensor) -> None:
     super().__init__()
     self.w1, self.w2 = w1, w2
   def forward(self, x):
@@ -65,6 +65,71 @@ class RoPE(nn.Module):
     q_rot = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
     k_rot = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
     return q_rot, k_rot
+
+class LatentHead(nn.Module):
+  """
+    Multi-Query Latent Attention
+    discussed in paper by deepseek: https://arxiv.org/pdf/2502.07864
+  """
+  def __init__(self, head_size, d_model, dropout, block_size, latent_dim=None, mask=False):
+    super().__init__()
+    # Default latent dimension: compress to half of head_size if not provided
+    if latent_dim is None:
+      latent_dim = max(1, head_size // 2)
+    self.query = nn.Linear(d_model, head_size, bias=True)
+
+    # For keys: decompose the projection into two parts: Wa_K and Wb_K
+    self.wa_key = nn.Linear(d_model, latent_dim, bias=False)
+    self.wb_key = nn.Linear(latent_dim, head_size, bias=False)
+
+    # For values: similar decomposition into Wa_V and Wb_V
+    self.wa_value = nn.Linear(d_model, latent_dim, bias=False)
+    self.wb_value = nn.Linear(latent_dim, head_size, bias=False)
+
+    self.dropout = nn.Dropout(dropout)
+    self.mask = mask
+    if mask:
+      self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+    self.pos_emb = RoPE(head_size, block_size)    # Rotary Positional Embedding layer remains the same
+
+  def forward(self, x):
+    B, T, C = x.shape
+    
+    # Compute query, latent key and latent value
+    query = self.query(x)                      # (B, T, head_size)
+    latent_key = self.wa_key(x)                # (B, T, latent_dim)
+    latent_value = self.wa_value(x)            # (B, T, latent_dim)
+    
+    # Expand the latent representations to full key and value
+    key = self.wb_key(latent_key)              # (B, T, head_size)
+    value = self.wb_value(latent_value)          # (B, T, head_size)
+    query, key = self.pos_emb(query, key)     # cpply Rotary Positional Embedding to query and key
+    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** 0.5)    # compute scaled dot-product attention scores
+    
+    # apply masking if needed (decoder part)
+    if self.mask:
+      if T > self.tril.size(0):
+        self.tril = torch.tril(torch.ones(T, T, device=scores.device))
+      scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+
+    attention = self.dropout(F.softmax(scores, dim=-1))   # apply softmax and dropout
+    output = torch.matmul(attention, value)    # compute the output as the weighted sum of the value vectors
+    return output
+
+class MultiHeadLatentAttention(nn.Module):
+  def __init__(self, d_model, dropout, n_head, block_size, mask, latent_dim=None):
+    head_size = d_model // n_head
+    super().__init__()
+    self.heads = nn.ModuleList(
+      [Head(head_size, d_model, dropout, block_size, latent_dim, mask) for _ in range(n_head)]
+    )
+    self.proj = nn.Linear(n_head * head_size, d_model)
+    self.dropout = nn.Dropout(dropout)
+    
+  def forward(self, x):
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
+    out = self.dropout(self.proj(out))
+    return out
 
 class Head(nn.Module):
   def __init__(self, head_size, d_model, dropout, block_size, mask=False):
@@ -148,7 +213,7 @@ class SparseMoE(nn.Module):
   def forward(self, x):
     batch_size, seq_len, _ = x.shape
     gating_output, indices = self.router(x)
-    final_output = torch.zeros_like(x)
+    final_outputs = torch.zeros_like(x)
 
     flat_x = x.view(-1, x.size(-1))
     flat_gating_output = gating_output.view(-1, gating_output.size(-1))
