@@ -45,132 +45,121 @@ class SwiGLU(nn.Module):
     x1, x2 = x_proj.chunk(2, dim=-1)  # each [batch, ..., hidden_dim]
     return F.silu(x1) * x2
 
-class RoPE(nn.Module):
-  def __init__(self, head_size, block_size, device):
+def rotate_half(x):
+  x1, x2 = x.chunk(2, dim=-1)
+  return torch.cat((-x2, x1), dim=-1)
+
+def apply_rope(q, k, cos, sin):
+  q = (q * cos) + (rotate_half(q) * sin)
+  k = (k * cos) + (rotate_half(k) * sin)
+  return q, k
+
+def apply_rope_x(x, cos, sin):
+  return (x * cos) + (rotate_half(x) * sin)
+
+class MLA(torch.nn.Module):
+  def __init__(self, d_model, n_heads, max_len=1024, rope_theta=10000.0):
     super().__init__()
-    self.head_size = head_size
-    self.block_size = block_size
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_size, 2).float() / head_size))
-    position = torch.arange(0, self.block_size, dtype=torch.float, device=device)  # (block_size,)
-    sinusoidal = torch.einsum("i,j->ij", position, inv_freq)  # Shape: (block_size, head_size // 2)
-    self.register_buffer("cos_emb", sinusoidal.cos(), persistent=False)  # (block_size, head_size // 2)
-    self.register_buffer("sin_emb", sinusoidal.sin(), persistent=False)  # (block_size, head_size // 2)
+    self.d_model, self.n_heads = d_model, n_heads
+    self.dh = d_model // n_heads
+    self.q_proj_dim, self.kv_proj_dim = d_model // 2, (2*d_model) // 3
+    self.qk_nope_dim, self.qk_rope_dim = self.dh // 2, self.dh // 2
 
-  def forward(self, q, k):
-    # spliting tensors into even and odd components
-    q1, q2 = q[..., ::2], q[..., 1::2]
-    k1, k2 = k[..., ::2], k[..., 1::2]
-    assert q.size(-1) == self.head_size, f"Query size mismatch: {q.size(-1)} != {self.head_size}"
-    assert k.size(-1) == self.head_size, f"Key size mismatch: {k.size(-1)} != {self.head_size}"
-    # retrieving embeddings for current sequence length
-    cos = self.cos_emb[:q.shape[1], :].unsqueeze(0).to(q.device)
-    sin = self.sin_emb[:q.shape[1], :].unsqueeze(0).to(q.device)
+    ## Q projections
+    # Lora
+    self.W_dq = torch.nn.Parameter(0.01*torch.randn((d_model, self.q_proj_dim)))
+    self.W_uq = torch.nn.Parameter(0.01*torch.randn((self.q_proj_dim, self.d_model)))
+    self.q_layernorm = torch.nn.LayerNorm(self.q_proj_dim)
+        
+    ## KV projections
+    # Lora
+    self.W_dkv = torch.nn.Parameter(0.01*torch.randn((d_model, self.kv_proj_dim + self.qk_rope_dim)))
+    self.W_ukv = torch.nn.Parameter(0.01*torch.randn((self.kv_proj_dim, self.d_model + (self.n_heads * self.qk_nope_dim))))
+    self.kv_layernorm = torch.nn.LayerNorm(self.kv_proj_dim)
 
-    # applying rotations
-    q_rot = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
-    k_rot = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
-    return q_rot, k_rot
+    # output projection
+    self.W_o = torch.nn.Parameter(0.01*torch.randn((d_model, d_model)))
 
-class LatentHead(nn.Module):
-  """
-    Multi-Query Latent Attention
-    discussed in paper by deepseek: https://arxiv.org/pdf/2502.07864
-  """
-  def __init__(self, head_size, d_model, dropout, block_size, device, latent_dim=None, mask=False):
-    super().__init__()
-    # Default latent dimension: compress to half of head_size if not provided
-    if latent_dim is None:
-      latent_dim = max(1, head_size // 2)
-    self.query = nn.Linear(d_model, head_size, bias=True)
+    # RoPE
+    self.max_seq_len = max_len
+    self.rope_theta = rope_theta
 
-    # For keys: decompose the projection into two parts: Wa_K and Wb_K
-    self.wa_key = nn.Linear(d_model, latent_dim, bias=False)
-    self.wb_key = nn.Linear(latent_dim, head_size, bias=False)
+    # https://github.com/lucidrains/rotary-embedding-torch/tree/main
+    # visualize emb later to make sure it looks ok
+    # we do self.dh here instead of self.qk_rope_dim because its better
+    freqs = 1.0 / (rope_theta ** (torch.arange(0, self.dh, 2).float() / self.dh))
+    emb = torch.outer(torch.arange(self.max_seq_len).float(), freqs)
+    cos_cached = emb.cos()[None, None, :, :]
+    sin_cached = emb.sin()[None, None, :, :]
 
-    # For values: similar decomposition into Wa_V and Wb_V
-    self.wa_value = nn.Linear(d_model, latent_dim, bias=False)
-    self.wb_value = nn.Linear(latent_dim, head_size, bias=False)
+    # https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_buffer
+    # This is like a parameter but its a constant so we can use register_buffer
+    self.register_buffer("cos_cached", cos_cached)
+    self.register_buffer("sin_cached", sin_cached)
 
-    self.dropout = nn.Dropout(dropout)
-    self.mask = mask
-    if mask:
-      self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-    self.pos_emb = RoPE(head_size, block_size, device)    # Rotary Positional Embedding layer remains the same
+  def forward(self, x, kv_cache=None, past_length=0):
+    B, S, D = x.size()
 
-  def forward(self, x):
-    B, T, C = x.shape
+    # Q Projections
+    compressed_q = x @ self.W_dq
+    compressed_q = self.q_layernorm(compressed_q)
+    Q = compressed_q @ self.W_uq
+    Q = Q.view(B, -1, self.n_heads, self.dh).transpose(1,2)
+    Q, Q_for_rope = torch.split(Q, [self.qk_nope_dim, self.qk_rope_dim], dim=-1)
 
-    # Compute query, latent key and latent value
-    query = self.query(x)                      # (B, T, head_size)
-    latent_key = self.wa_key(x)                # (B, T, latent_dim)
-    latent_value = self.wa_value(x)            # (B, T, latent_dim)
+    # Q Decoupled RoPE
+    cos_q = self.cos_cached[:, :, past_length:past_length+S, :self.qk_rope_dim//2].repeat(1, 1, 1, 2)
+    sin_q = self.sin_cached[:, :, past_length:past_length+S, :self.qk_rope_dim//2].repeat(1, 1, 1, 2)
+    Q_for_rope = apply_rope_x(Q_for_rope, cos_q, sin_q)
 
-    # Expand the latent representations to full key and value
-    key = self.wb_key(latent_key)              # (B, T, head_size)
-    value = self.wb_value(latent_value)          # (B, T, head_size)
-    query, key = self.pos_emb(query, key)     # cpply Rotary Positional Embedding to query and key
-    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** 0.5)    # compute scaled dot-product attention scores
+    # KV Projections
+    if kv_cache is None:
+      compressed_kv = x @ self.W_dkv
+      KV_for_lora, K_for_rope = torch.split(compressed_kv, [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+      KV_for_lora = self.kv_layernorm(KV_for_lora)
+    else:
+      new_kv = x @ self.W_dkv
+      compressed_kv = torch.cat([kv_cache, new_kv], dim=1)
+      new_kv, new_K_for_rope = torch.split(new_kv, [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+      old_kv, old_K_for_rope = torch.split(kv_cache, [self.kv_proj_dim, self.qk_rope_dim], dim=-1)
+      new_kv = self.kv_layernorm(new_kv)
+      old_kv = self.kv_layernorm(old_kv)
+      KV_for_lora = torch.cat([old_kv, new_kv], dim=1)
+      K_for_rope = torch.cat([old_K_for_rope, new_K_for_rope], dim=1)
+            
 
-    # apply masking if needed (decoder part)
-    if self.mask:
-      if T > self.tril.size(0):
-        self.tril = torch.tril(torch.ones(T, T, device=scores.device))
-      scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+      KV = KV_for_lora @ self.W_ukv
+      KV = KV.view(B, -1, self.n_heads, self.dh+self.qk_nope_dim).transpose(1,2)
+      K, V = torch.split(KV, [self.qk_nope_dim, self.dh], dim=-1)
+      S_full = K.size(2)        
 
-    attention = self.dropout(F.softmax(scores, dim=-1))   # apply softmax and dropout
-    output = torch.matmul(attention, value)    # compute the output as the weighted sum of the value vectors
-    return output
+      # K Rope
+      K_for_rope = K_for_rope.view(B, -1, 1, self.qk_rope_dim).transpose(1,2)
+      cos_k = self.cos_cached[:, :, :S_full, :self.qk_rope_dim//2].repeat(1, 1, 1, 2)
+      sin_k = self.sin_cached[:, :, :S_full, :self.qk_rope_dim//2].repeat(1, 1, 1, 2)
+      K_for_rope = apply_rope_x(K_for_rope, cos_k, sin_k)
 
-class MultiHeadLatentAttention(nn.Module):
-  def __init__(self, d_model, dropout, n_head, block_size, device, mask, latent_dim=None):
-    head_size = d_model // n_head
-    super().__init__()
-    self.heads = nn.ModuleList(
-      [LatentHead(head_size, d_model, dropout, block_size, device, latent_dim, mask) for _ in range(n_head)]
-    )
-    self.proj = nn.Linear(n_head * head_size, d_model)
-    self.dropout = nn.Dropout(dropout)
-  def forward(self, x):
-    out = torch.cat([h(x) for h in self.heads], dim=-1)
-    out = self.dropout(self.proj(out))
-    return out
+      # apply position encoding to each head
+      K_for_rope = K_for_rope.repeat(1, self.n_heads, 1, 1)
 
-class Head(nn.Module):
-  def __init__(self, head_size, d_model, dropout, block_size, device, mask=False):
-    super().__init__()
-    self.key = nn.Linear(d_model, head_size, bias=True)
-    self.query = nn.Linear(d_model, head_size, bias=True)
-    self.value = nn.Linear(d_model, head_size, bias=True)
-    self.dropout = nn.Dropout(dropout)
-    self.mask = mask
-    if mask:
-      self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-    self.pos_emb = RoPE(head_size, block_size, device)
-  def forward(self, x):
-    B, T, C = x.shape
-    key, query, value = self.key(x), self.query(x), self.value(x)
-    query, key = self.pos_emb(query, key)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** 0.5)
-    if T > self.tril.size(0):
-      self.tril = torch.tril(torch.ones(T, T, device=scores.device))
-    scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-    attention = self.dropout(F.softmax(scores, dim=-1))
-    output = torch.matmul(attention, value)
-    return output
+      # split into multiple heads
+      q_heads = torch.cat([Q, Q_for_rope], dim=-1)
+      k_heads = torch.cat([K, K_for_rope], dim=-1)
+      v_heads = V # already reshaped before the split
 
-class MultiHeadAttention(nn.Module):
-  def __init__(self, d_model, dropout, n_head, block_size, device, mask):
-    head_size = d_model // n_head
-    super().__init__()
-    self.heads = nn.ModuleList(
-      [Head(head_size, d_model, dropout, block_size, device, mask) for _ in range(n_head)]
-    )
-    self.proj = nn.Linear(n_head * head_size, d_model)
-    self.dropout = nn.Dropout(dropout)
-  def forward(self, x):
-    out = torch.cat([h(x) for h in self.heads], dim=-1)
-    out = self.dropout(self.proj(out))
-    return out
+      # make attention mask
+      mask = torch.ones((S,S_full), device=x.device)
+      mask = torch.tril(mask, diagonal=past_length)
+      mask = mask[None, None, :, :]
+
+      sq_mask = mask == 1
+      # attention
+      x = torch.nn.functional.scaled_dot_product_attention(q_heads, k_heads, v_heads, attn_mask=sq_mask)
+      x = x.transpose(1, 2).reshape(B, S, D)
+
+      # apply projection
+      x = x @ self.W_o.T
+      return x, compressed_kv
 
 class Expert(nn.Module):
   def __init__(self, d_model, hidden_dim, dropout, ffn_multiplier=None) -> None:
@@ -239,10 +228,10 @@ class SparseMoE(nn.Module):
     return final_outputs
 
 class Block(nn.Module):
-  def __init__(self, d_model, n_head, n_experts, top_k, n_ff, dropout, ffn_multiplier, block_size, device, n_latent, capacity_factor) -> None:
+  def __init__(self, d_model, n_heads, n_experts, top_k, n_ff, dropout, ffn_multiplier, block_size, device, n_latent, capacity_factor) -> None:
     super().__init__()
-    self.sa = MultiHeadLatentAttention(d_model, dropout, n_head, block_size, device, False, n_latent)
-    self.ca = MultiHeadLatentAttention(d_model, dropout, n_head, block_size, device, True, n_latent)
+    self.sa = MLA(d_model, n_heads, block_size) # replaced with newer accurate RoPE integrated MLA
+    self.ca = MLA(d_model, n_heads, block_size) # replaced with newer accurate RoPE integrated MLA
     self.smoe = SparseMoE(d_model, n_experts, top_k, n_ff, dropout, ffn_multiplier, capacity_factor)
     self.ln1 = RMSNorm(d_model)
     self.ln2 = RMSNorm(d_model)
@@ -261,7 +250,7 @@ class TransformerMoE(nn.Module):
     self.d_model = params.d_model
     self.n_layers = params.n_layers
     self.token_embeddings = nn.Embedding(vocab_size, self.d_model)
-    self.blocks = nn.ModuleList([Block(d_model=params.d_model, n_head=params.n_heads, n_experts=params.n_experts, top_k=params.top_k, n_ff=params.n_ff, ffn_multiplier=params.ffn_multiplier, dropout=params.dropout, block_size=params.block_size, device=params.device, n_latent=params.n_latent, capacity_factor=params.capacity_factor) for _ in range(self.n_layers)])
+    self.blocks = nn.ModuleList([Block(d_model=params.d_model, n_heads=params.n_heads, n_experts=params.n_experts, top_k=params.top_k, n_ff=params.n_ff, ffn_multiplier=params.ffn_multiplier, dropout=params.dropout, block_size=params.block_size, device=params.device, n_latent=params.n_latent, capacity_factor=params.capacity_factor) for _ in range(self.n_layers)])
     self.norm_final = RMSNorm(self.d_model, params.norm_eps)
     self.linear_final = nn.Linear(self.d_model, vocab_size, bias=False)
     self.apply(kaiming_init_weights)
