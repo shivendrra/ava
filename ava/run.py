@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import tiktoken
 
-from .text.moe import TransformerMoE
+from .model import TransformerMoE
 
 def load_config(config_path: str, model_name: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
   with open(config_path, 'r') as f:
@@ -52,7 +52,12 @@ def prepare_dataset(data_path: str, train_split: float = 0.9) -> Tuple[torch.Ten
 
 def get_batch(data: torch.Tensor, batch_size: int, block_size: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
   """Generate a batch of data for training"""
-  ix = torch.randint(len(data) - block_size, (batch_size,))
+  # Ensure we don't go out of bounds
+  max_start_idx = len(data) - block_size - 1
+  if max_start_idx <= 0:
+    raise ValueError(f"Dataset too small. Need at least {block_size + 1} tokens, got {len(data)}")
+  
+  ix = torch.randint(0, max_start_idx, (batch_size,))
   x = torch.stack([data[i:i+block_size] for i in ix])
   y = torch.stack([data[i+1:i+block_size+1] for i in ix])
   x, y = x.to(device), y.to(device)
@@ -65,24 +70,34 @@ def estimate_loss(model: nn.Module, train_data: torch.Tensor, val_data: torch.Te
   losses = {}
   
   for split, data in [('train', train_data), ('val', val_data)]:
+    if len(data) <= block_size:
+      print(f"Warning: {split} data too small, skipping evaluation")
+      losses[split] = float('inf')
+      losses[f'{split}_acc'] = 0.0
+      continue
+      
     total_loss = 0.0
     total_correct = 0
     total_tokens = 0
     
     for _ in range(eval_iters):
-      X, Y = get_batch(data, batch_size, block_size, device)
-      logits, loss = model(X, Y)
-      
-      total_loss += loss.item()
-      
-      # Calculate accuracy
-      predictions = torch.argmax(logits, dim=-1)
-      correct = (predictions == Y).sum().item()
-      total_correct += correct
-      total_tokens += Y.numel()
+      try:
+        X, Y = get_batch(data, batch_size, block_size, device)
+        logits, loss, _ = model(X, Y)
+        
+        total_loss += loss.item()
+        
+        # Calculate accuracy
+        predictions = torch.argmax(logits, dim=-1)
+        correct = (predictions == Y).sum().item()
+        total_correct += correct
+        total_tokens += Y.numel()
+      except Exception as e:
+        print(f"Error in evaluation: {e}")
+        continue
     
-    losses[split] = total_loss / eval_iters
-    losses[f'{split}_acc'] = total_correct / total_tokens
+    losses[split] = total_loss / eval_iters if total_loss > 0 else float('inf')
+    losses[f'{split}_acc'] = total_correct / total_tokens if total_tokens > 0 else 0.0
   
   model.train()
   return losses
@@ -167,7 +182,7 @@ def main():
   
   # google-drive dataset URL (replace with your actual URL)
   dataset_url = "https://drive.google.com/"
-  dataset_path = "dataset.txt"
+  dataset_path = "/teamspace/uploads/dataset.txt"
 
   # load configurations
   print("Loading configurations...")
@@ -212,17 +227,25 @@ def main():
   )
 
   # compiling model for faster training (PyTorch 2.0+)
-  if train_config.get('compile', False):
-    print("Compiling model...")
-    try:
-      model = torch.compile(model)
-      print("Model compiled successfully!")
-    except:
-      print("Model compilation failed, continuing without compilation")
+  # Disable compilation initially to debug the error
+  compile_model = train_config.get('compile', False)
+  if compile_model:
+    print("Model compilation disabled for debugging. Enable after fixing issues.")
+    # print("Compiling model...")
+    # try:
+    #   model = torch.compile(model)
+    #   print("Model compiled successfully!")
+    # except:
+    #   print("Model compilation failed, continuing without compilation")
   
   # Training setup
-  scaler = torch.cuda.amp.GradScaler(enabled=(train_config.get('dtype') == 'bfloat16'))
-  ctx = nullcontext() if device == 'cpu' else torch.amp.autocast(device_type=device, dtype=torch.bfloat16)
+  scaler = torch.amp.GradScaler(enabled=(device == 'cuda' and train_config.get('dtype') == 'bfloat16'))
+  
+  # Fix autocast context
+  if device == 'cuda':
+    ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
+  else:
+    ctx = nullcontext()
   
   # Training parameters
   max_iters = train_config.get('max_iters', 600000)
@@ -250,52 +273,66 @@ def main():
   step = 0
   start_time = time.time()
   
-  losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
-  print(f"\nStep {step:6d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | " f"Train Acc: {losses['train_acc']:.3f} | Val Acc: {losses['val_acc']:.3f}")
+  # Initial evaluation
+  try:
+    losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
+    print(f"\nStep {step:6d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | " f"Train Acc: {losses['train_acc']:.3f} | Val Acc: {losses['val_acc']:.3f}")
+  except Exception as e:
+    print(f"Initial evaluation failed: {e}")
+    print("Continuing with training...")
   
   while step < max_iters:
-    lr = get_lr(step, warmup_steps, lr_decay_steps, learning_rate, min_lr)
-    for param_group in optimizer.param_groups:
-      param_group['lr'] = lr
-    
-    # Evaluate and log
-    if step % eval_interval == 0 and step > 0:
-      losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
-      elapsed_time = time.time() - start_time
-      avg_time_per_step = elapsed_time / step if step > 0 else 0
+    try:
+      lr = get_lr(step, warmup_steps, lr_decay_steps, learning_rate, min_lr)
+      for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
       
-      print(f"Step {step:6d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | " f"Train Acc: {losses['train_acc']:.3f} | Val Acc: {losses['val_acc']:.3f} | " f"LR: {lr:.2e} | Time/Step: {avg_time_per_step:.2f}s")
+      # Evaluate and log
+      if step % eval_interval == 0 and step > 0:
+        try:
+          losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
+          elapsed_time = time.time() - start_time
+          avg_time_per_step = elapsed_time / step if step > 0 else 0
+          
+          print(f"Step {step:6d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | " f"Train Acc: {losses['train_acc']:.3f} | Val Acc: {losses['val_acc']:.3f} | " f"LR: {lr:.2e} | Time/Step: {avg_time_per_step:.2f}s")
+        except Exception as e:
+          print(f"Evaluation failed at step {step}: {e}")
 
-    # Training step
-    optimizer.zero_grad(set_to_none=True)
-    loss_accum = 0.0
-    
-    for micro_step in range(gradient_accumulation_steps):
-      X, Y = get_batch(train_data, batch_size, block_size, device)
+      # Training step
+      optimizer.zero_grad(set_to_none=True)
+      loss_accum = 0.0
       
-      with ctx:
-        logits, loss = model(X, Y)
-        loss = loss / gradient_accumulation_steps
-        loss_accum += loss.detach()
+      for micro_step in range(gradient_accumulation_steps):
+        X, Y = get_batch(train_data, batch_size, block_size, device)
+        
+        with ctx:
+          logits, loss, _ = model(X, Y)
+          loss = loss / gradient_accumulation_steps
+          loss_accum += loss.detach()
+        
+        scaler.scale(loss).backward()
       
-      scaler.scale(loss).backward()
-    
-    # Gradient clipping
-    if grad_clip != 0.0:
-      scaler.unscale_(optimizer)
-      torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    
-    # Optimizer step
-    scaler.step(optimizer)
-    scaler.update()
-    
-    step += 1
-    
-    # Log training progress
-    if step % log_interval == 0:
-      elapsed_time = time.time() - start_time
-      avg_time_per_step = elapsed_time / step
-      print(f"Step {step:6d} | Loss: {loss_accum:.4f} | LR: {lr:.2e} | Time/Step: {avg_time_per_step:.2f}s")
+      # Gradient clipping
+      if grad_clip != 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+      
+      # Optimizer step
+      scaler.step(optimizer)
+      scaler.update()
+      
+      step += 1
+      
+      # Log training progress
+      if step % log_interval == 0:
+        elapsed_time = time.time() - start_time
+        avg_time_per_step = elapsed_time / step
+        print(f"Step {step:6d} | Loss: {loss_accum:.4f} | LR: {lr:.2e} | Time/Step: {avg_time_per_step:.2f}s")
+        
+    except Exception as e:
+      print(f"Training error at step {step}: {e}")
+      print("Stopping training...")
+      break
   
   print(f"\nTraining completed! Total time: {(time.time() - start_time) / 3600:.2f} hours")
   
@@ -312,10 +349,13 @@ def main():
   print(f"Model saved as {model_name}_final.pt")
   
   # Final evaluation
-  losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
-  print(f"\nFinal Results:")
-  print(f"Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f}")
-  print(f"Train Accuracy: {losses['train_acc']:.3f} | Val Accuracy: {losses['val_acc']:.3f}")
+  try:
+    losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
+    print(f"\nFinal Results:")
+    print(f"Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f}")
+    print(f"Train Accuracy: {losses['train_acc']:.3f} | Val Accuracy: {losses['val_acc']:.3f}")
+  except Exception as e:
+    print(f"Final evaluation failed: {e}")
 
 if __name__ == "__main__":
   main()
