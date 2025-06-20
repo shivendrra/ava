@@ -1,361 +1,447 @@
-import json, time, math
-import pickle
-from contextlib import nullcontext
-from typing import Dict, Any, Tuple
+from datetime import datetime
+from typing import Dict, Any, Tuple, List, Optional
 import torch
-import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import json, time, logging, gc
+from pathlib import Path
+import numpy as np
 import tiktoken
 
-from .model import TransformerMoE
+from .text.moe import TransformerMoE
+from .dataset import Dataset
 
-def load_config(config_path: str, model_name: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-  with open(config_path, 'r') as f:
-    configs = json.load(f)
-  
-  if isinstance(configs, list):
-    configs = configs[0]  # taking first config if it's a list
-    # [0] => 500M
-    # [1] => 750M
-    # [2] => 1B
+class EarlyStopping:
+  """Early stopping utility"""
+  def __init__(self, patience: int = 7, min_delta: float = 0.001):
+    self.patience = patience
+    self.min_delta = min_delta
+    self.counter = 0
+    self.best_loss = float('inf')
 
-  if model_name not in configs:
-    raise ValueError(f"Model '{model_name}' not found in config. Available: {list(configs.keys())}")
-  
-  model_config = configs[model_name]['ModelConfig']
-  train_config = configs[model_name]['TrainConfig']
-  
-  return model_config, train_config
+  def __call__(self, val_loss: float) -> bool:
+    if val_loss < self.best_loss - self.min_delta:
+      self.best_loss = val_loss
+      self.counter = 0
+      return False
+    else:
+      self.counter += 1
+      return self.counter >= self.patience
 
-def prepare_dataset(data_path: str, train_split: float = 0.9) -> Tuple[torch.Tensor, torch.Tensor]:
-  """Load and prepare dataset for training"""
-  print("Loading dataset...")
+class Config:
+  """Configuration class for model parameters"""
+  def __init__(self, **kwargs):
+    for key, value in kwargs.items():
+      setattr(self, key, value)
 
-  with open(data_path, 'r', encoding='utf-8') as f:
-    text = f.read()  
-  print(f"Dataset loaded: {len(text):,} characters")
+class MultiTrainer:
+  def __init__(self, config_path: str, model_name: str, dataset_path: List[str], dataset_names: List[str], save_dir: str, log_dir: str, encoding: str = "gpt2", device: str = 'cuda'):
+    self.config_path = Path(config_path)
+    self.dataset_path = dataset_path
+    self.save_dir = Path(save_dir)
+    self.log_dir = Path(log_dir)
+    self.encoding = encoding
+    self.dataset_names = dataset_names
+    self.device = device
 
-  enc = tiktoken.get_encoding("cl100k_base")  # AVA-4 tokenizer  
-  print("Tokenizing dataset...")
-  tokens = enc.encode(text)
-  tokens = torch.tensor(tokens, dtype=torch.long)
-  print(f"Tokenized: {len(tokens):,} tokens")
-  
-  # train/validation split
-  n = int(train_split * len(tokens))
-  train_data = tokens[:n]
-  val_data = tokens[n:]
+    # Create directories
+    self.save_dir.mkdir(parents=True, exist_ok=True)
+    self.log_dir.mkdir(parents=True, exist_ok=True)
 
-  print(f"Train tokens: {len(train_data):,}")
-  print(f"Validation tokens: {len(val_data):,}")
-
-  return train_data, val_data
-
-def get_batch(data: torch.Tensor, batch_size: int, block_size: int, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
-  """Generate a batch of data for training"""
-  # Ensure we don't go out of bounds
-  max_start_idx = len(data) - block_size - 1
-  if max_start_idx <= 0:
-    raise ValueError(f"Dataset too small. Need at least {block_size + 1} tokens, got {len(data)}")
-  
-  ix = torch.randint(0, max_start_idx, (batch_size,))
-  x = torch.stack([data[i:i+block_size] for i in ix])
-  y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-  x, y = x.to(device), y.to(device)
-  return x, y
-
-@torch.no_grad()
-def estimate_loss(model: nn.Module, train_data: torch.Tensor, val_data: torch.Tensor, eval_iters: int, batch_size: int, block_size: int, device: str) -> Dict[str, float]:
-  """Estimate loss on train and validation sets"""
-  model.eval()
-  losses = {}
-  
-  for split, data in [('train', train_data), ('val', val_data)]:
-    if len(data) <= block_size:
-      print(f"Warning: {split} data too small, skipping evaluation")
-      losses[split] = float('inf')
-      losses[f'{split}_acc'] = 0.0
-      continue
-      
-    total_loss = 0.0
-    total_correct = 0
-    total_tokens = 0
+    # Setup logging
+    self.setup_logging()
     
-    for _ in range(eval_iters):
+    # Load datasets
+    self.datasets = {}
+    self.current_dataset_idx = 0
+    self.load_datasets()
+    
+    # Load configurations
+    self.model_config, self.train_config = self.load_config(model_name)
+    
+    # Initialize model
+    vocab_size = tiktoken.get_encoding(encoding).n_vocab
+    self.config = Config(**self.model_config)
+    self.model = TransformerMoE(self.config, vocab_size).to(device)
+    self.n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
+    self.logger.info(f"Model initialized with {self.n_params:.2f}M parameters, vocab size: {vocab_size}")
+
+    # Training state
+    self.optimizer = None
+    self.scheduler = None
+    self.global_step = 0
+    self.epoch = 0
+    self.early_stopping = EarlyStopping(patience=10, min_delta=0.001)
+    self.training_history = []
+    self.writer = SummaryWriter(self.log_dir)
+
+  def setup_logging(self):
+    log_file = self.log_dir / f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+      level=logging.INFO,
+      format='%(asctime)s - %(levelname)s - %(message)s',
+      handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
+    )
+    self.logger = logging.getLogger(__name__)
+
+  def load_config(self, model_name: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    with open(self.config_path, 'r') as f:
+      configs = json.load(f)
+    
+    if isinstance(configs, list):
+      configs = configs[0]
+
+    if model_name not in configs:
+      raise ValueError(f"Model '{model_name}' not found in config. Available: {list(configs.keys())}")
+    
+    model_config = configs[model_name]['ModelConfig']
+    train_config = configs[model_name]['TrainConfig']
+    
+    return model_config, train_config
+
+  def load_datasets(self):
+    self.logger.info("Loading datasets...")
+    for path, name in zip(self.dataset_path, self.dataset_names):
       try:
-        X, Y = get_batch(data, batch_size, block_size, device)
-        logits, loss, _ = model(X, Y)
-        
-        total_loss += loss.item()
-        
-        # Calculate accuracy
-        predictions = torch.argmax(logits, dim=-1)
-        correct = (predictions == Y).sum().item()
-        total_correct += correct
-        total_tokens += Y.numel()
+        dataset = Dataset(path, self.encoding, 0.25, 1600)
+        self.datasets[name] = dataset
+        stats = dataset.get_data_stats()
+        self.logger.info(f"Dataset '{name}' loaded: {stats}")
       except Exception as e:
-        print(f"Error in evaluation: {e}")
+        self.logger.error(f"Failed to load dataset '{name}': {e}")
         continue
+
+    if not self.datasets:
+      raise ValueError("No datasets loaded!")
+
+  def get_current_dataset(self) -> Dataset:
+    return self.datasets[self.dataset_names[self.current_dataset_idx]]
+
+  def switch_dataset(self):
+    self.current_dataset_idx = (self.current_dataset_idx + 1) % len(self.dataset_names)
+    current_name = self.dataset_names[self.current_dataset_idx]
+    self.logger.info(f"Switched to dataset: {current_name}")
+
+  def setup_training(self):
+    learning_rate = self.train_config.get('learning_rate', 6e-4)
+    weight_decay = self.train_config.get('weight_decay', 0.1)
+    beta1 = self.train_config.get('beta1', 0.9)
+    beta2 = self.train_config.get('beta2', 0.95)
     
-    losses[split] = total_loss / eval_iters if total_loss > 0 else float('inf')
-    losses[f'{split}_acc'] = total_correct / total_tokens if total_tokens > 0 else 0.0
-  
-  model.train()
-  return losses
+    self.optimizer = optim.AdamW(
+      self.model.parameters(), 
+      lr=learning_rate,
+      weight_decay=weight_decay, 
+      betas=(beta1, beta2)
+    )
 
-def get_lr(step: int, warmup_steps: int, lr_decay_steps: int, max_lr: float, min_lr: float) -> float:
-  """Get learning rate with warmup and cosine decay"""
-  # Linear warmup
-  if step < warmup_steps:
-    return max_lr * step / warmup_steps
+    # Learning rate scheduler with warmup
+    warmup_steps = self.train_config.get('warmup_steps', 2000)
+    lr_decay_steps = self.train_config.get('lr_decay_steps', 600000)
+    min_lr = self.train_config.get('min_lr', 6e-5)
+    
+    def lr_lambda(step):
+      if step < warmup_steps:
+        return step / warmup_steps
+      # Cosine decay after warmup
+      progress = (step - warmup_steps) / (lr_decay_steps - warmup_steps)
+      return max(min_lr / learning_rate, 0.5 * (1 + np.cos(np.pi * progress)))
 
-  # Cosine decay
-  if step > lr_decay_steps:
-    return min_lr
-  
-  decay_ratio = (step - warmup_steps) / (lr_decay_steps - warmup_steps)
-  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-  return min_lr + coeff * (max_lr - min_lr)
+    self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+    self.logger.info("Training setup completed")
 
-def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: float, betas: Tuple[float, float]) -> torch.optim.Optimizer:
-  """Configure optimizer with weight decay for specific parameters"""
-  # Separate parameters that should and shouldn't be weight decayed
-  decay = set()
-  no_decay = set()
+  def train_step(self, batch_size: int, block_size: int) -> Dict[str, float]:
+    self.model.train()
+    
+    # Get batch from current dataset
+    dataset = self.get_current_dataset()
+    try:
+      x, y = dataset.get_batch("train", batch_size, block_size, self.device)
+    except Exception as e:
+      self.logger.warning(f"Failed to get batch, switching dataset: {e}")
+      self.switch_dataset()
+      dataset = self.get_current_dataset()
+      x, y = dataset.get_batch("train", batch_size, block_size, self.device)
 
-  whitelist_weight_modules = (torch.nn.Linear, )
-  blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-  
-  for mn, m in model.named_modules():
-    for pn, p in m.named_parameters():
-      fpn = '%s.%s' % (mn, pn) if mn else pn
+    # Forward pass
+    self.optimizer.zero_grad()
+    
+    with torch.cuda.amp.autocast(enabled=self.train_config.get('dtype') == 'bfloat16'):
+      logits, loss, _ = self.model(x, targets=y)
+    
+    # Backward pass with gradient clipping
+    loss.backward()
+    grad_clip = self.train_config.get('grad_clip', 1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip)
+    self.optimizer.step()
+    self.scheduler.step()
+
+    # Compute metrics
+    with torch.no_grad():
+      # Accuracy
+      pred_tokens = torch.argmax(logits, dim=-1)
+      accuracy = (pred_tokens == y).float().mean()
+
+      # Perplexity
+      perplexity = torch.exp(loss)
+
+    return {
+      'loss': loss.item(),
+      'accuracy': accuracy.item(),
+      'perplexity': perplexity.item(),
+      'grad_norm': grad_norm.item(),
+      'lr': self.optimizer.param_groups[0]['lr']
+    }
+
+  def validate(self, batch_size: int, block_size: int, num_batches: int = 10) -> Dict[str, float]:
+    self.model.eval()
+    
+    val_metrics = {
+      'loss': 0.0,
+      'accuracy': 0.0,
+      'perplexity': 0.0
+    }
+    total_batches = 0
+
+    with torch.no_grad():
+      for dataset_name, dataset in self.datasets.items():
+        for _ in range(num_batches):
+          try:
+            x, y = dataset.get_batch("val", batch_size, block_size, self.device)
+            logits, loss, _ = self.model(x, targets=y)
+
+            # Compute metrics
+            pred_tokens = torch.argmax(logits, dim=-1)
+            accuracy = (pred_tokens == y).float().mean()
+            perplexity = torch.exp(loss)
+            
+            # Accumulate metrics
+            val_metrics['loss'] += loss.item()
+            val_metrics['accuracy'] += accuracy.item()
+            val_metrics['perplexity'] += perplexity.item()
+            
+            total_batches += 1
+            
+          except Exception as e:
+            self.logger.warning(f"Validation batch failed for {dataset_name}: {e}")
+            continue
+
+    # Average metrics
+    if total_batches > 0:
+      for key in val_metrics:
+        val_metrics[key] /= total_batches
+
+    return val_metrics
+
+  def save_checkpoint(self, is_best: bool = False):
+    checkpoint = {
+      'epoch': self.epoch,
+      'global_step': self.global_step,
+      'model_state_dict': self.model.state_dict(),
+      'optimizer_state_dict': self.optimizer.state_dict(),
+      'scheduler_state_dict': self.scheduler.state_dict(),
+      'model_config': self.model_config,
+      'train_config': self.train_config,
+      'training_history': self.training_history,
+      'current_dataset_idx': self.current_dataset_idx
+    }
+
+    filename = "best_model.pth" if is_best else f"checkpoint_epoch_{self.epoch:03d}.pth"
+    filepath = self.save_dir / filename
+
+    try:
+      torch.save(checkpoint, filepath)
+      self.logger.info(f"Checkpoint saved: {filepath}")
+      return str(filepath)
+    except Exception as e:
+      self.logger.error(f"Failed to save checkpoint: {e}")
+      return None
+
+  def load_checkpoint(self, checkpoint_path: str) -> bool:
+    try:
+      checkpoint = torch.load(checkpoint_path, map_location=self.device)
+      self.model.load_state_dict(checkpoint['model_state_dict'])
       
-      if pn.endswith('bias'):
-        no_decay.add(fpn)
-      elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-        decay.add(fpn)
-      elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-        no_decay.add(fpn)
-  
-  # creating parameter groups
-  param_dict = {pn: p for pn, p in model.named_parameters()}
-  optim_groups = [
-    {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
-    {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
-  ]
+      if self.optimizer:
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+      if self.scheduler:
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+      self.epoch = checkpoint.get('epoch', 0)
+      self.global_step = checkpoint.get('global_step', 0)
+      self.training_history = checkpoint.get('training_history', [])
+      self.current_dataset_idx = checkpoint.get('current_dataset_idx', 0)
+      
+      self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
+      return True
+    except Exception as e:
+      self.logger.error(f"Failed to load checkpoint: {e}")
+      return False
 
-  optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
-  return optimizer
+  def train(self, num_epochs: int = None, resume_from: Optional[str] = None):
+    # Use config values if not provided
+    if num_epochs is None:
+      num_epochs = self.train_config.get('epochs', 1)
+    
+    batch_size = self.train_config.get('batch_size', 12)
+    micro_batch_size = self.train_config.get('micro_batch_size', 4)
+    gradient_accumulation_steps = self.train_config.get('gradient_accumulation_steps', 3)
+    block_size = self.train_config.get('block_size', 1024)
+    eval_interval = self.train_config.get('eval_interval', 2000)
+    log_interval = self.train_config.get('log_interval', 1)
+    
+    # Setup training
+    self.setup_training()
+    
+    # Resume from checkpoint if provided
+    if resume_from:
+      self.load_checkpoint(resume_from)
 
-def count_parameters(model: nn.Module) -> int:
-  """Count total number of parameters in the model"""
-  return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    self.logger.info("Starting training...")
+    self.logger.info(f"Parameters: epochs={num_epochs}, batch_size={batch_size}, "f"micro_batch_size={micro_batch_size}, block_size={block_size}")
 
-def print_model_info(model: nn.Module, model_config: Dict[str, Any]) -> None:
-  """Print detailed model information"""
-  print("\n" + "="*60)
-  print("MODEL INFORMATION")
-  print("="*60)
+    try:
+      start_time = time.time()
+      best_val_loss = float('inf')
 
-  total_params = count_parameters(model)
-  print(f"Total Parameters: {total_params:,} ({total_params/1e6:.1f}M)")
-  
-  print(f"Architecture:")
-  print(f"  - Layers: {model_config['n_layers']}")
-  print(f"  - Heads: {model_config['n_heads']}")
-  print(f"  - Model Dimension: {model_config['d_model']}")
-  print(f"  - Head Dimension: {model_config['d_model'] // model_config['n_heads']}")
-  print(f"  - FFN Multiplier: {model_config['ffn_multiplier']}")
-  print(f"  - Max Sequence Length: {model_config['max_seq_len']}")
-  print(f"  - Vocabulary Size: {model_config['vocab_size']}")
-  print(f"  - Dropout: {model_config['dropout']}")
-  
-  # memory estimation
-  param_size = total_params * 4 / (1024**3)  # 4 bytes per parameter
-  print(f"  - Estimated Model Size: {param_size:.2f} GB")
-  print("="*60)
+      for epoch in range(self.epoch, num_epochs):
+        self.epoch = epoch
+        epoch_start_time = time.time()
+        epoch_losses = []
+        
+        # Calculate steps per epoch based on gradient accumulation
+        steps_per_epoch = 1000 // gradient_accumulation_steps
+        
+        for step in range(steps_per_epoch):
+          step_losses = []
+          
+          # Gradient accumulation loop
+          for micro_step in range(gradient_accumulation_steps):
+            metrics = self.train_step(micro_batch_size, block_size)
+            step_losses.append(metrics)
+          
+          # Average metrics across micro-batches
+          avg_metrics = {}
+          for key in step_losses[0].keys():
+            avg_metrics[key] = np.mean([m[key] for m in step_losses])
+          
+          epoch_losses.append(avg_metrics)
+          self.global_step += 1
+          
+          # Log to tensorboard
+          for key, value in avg_metrics.items():
+            self.writer.add_scalar(f'train/{key}', value, self.global_step)
+          
+          # Print progress
+          if self.global_step % log_interval == 0:
+            current_dataset = self.dataset_names[self.current_dataset_idx]
+            self.logger.info(f"Step {self.global_step}: Dataset={current_dataset}, "f"Loss={avg_metrics['loss']:.4f}, "f"Acc={avg_metrics['accuracy']:.3f}, "f"PPL={avg_metrics['perplexity']:.2f}, "f"LR={avg_metrics['lr']:.2e}")
+
+          # Validation
+          if self.global_step % eval_interval == 0:
+            val_metrics = self.validate(micro_batch_size, block_size)
+
+            # Log validation metrics
+            for key, value in val_metrics.items():
+              self.writer.add_scalar(f'val/{key}', value, self.global_step)
+
+            self.logger.info(f"Validation - Loss: {val_metrics['loss']:.4f}, "f"Acc: {val_metrics['accuracy']:.3f}, "f"PPL: {val_metrics['perplexity']:.2f}")
+            # Check for improvement
+            if val_metrics['loss'] < best_val_loss:
+              best_val_loss = val_metrics['loss']
+              self.save_checkpoint(is_best=True)
+              self.logger.info("New best model saved!")
+
+            # Early stopping check
+            if self.early_stopping(val_metrics['loss']):
+              self.logger.info("Early stopping triggered")
+              return
+          # Dataset rotation every 500 steps
+          if self.global_step % 500 == 0 and len(self.datasets) > 1:
+            self.switch_dataset()
+
+          # Memory cleanup
+          if self.global_step % 100 == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+              torch.cuda.empty_cache()
+
+        # End of epoch
+        avg_epoch_loss = np.mean([m['loss'] for m in epoch_losses])
+        avg_accuracy = np.mean([m['accuracy'] for m in epoch_losses])
+        avg_perplexity = np.mean([m['perplexity'] for m in epoch_losses])
+        epoch_time = time.time() - epoch_start_time
+
+        self.training_history.append({
+          'epoch': epoch,
+          'avg_loss': avg_epoch_loss,
+          'avg_accuracy': avg_accuracy,
+          'avg_perplexity': avg_perplexity,
+          'epoch_time': epoch_time,
+          'global_step': self.global_step
+        })
+
+        self.logger.info(
+          f"Epoch {epoch + 1}/{num_epochs} completed in {epoch_time:.2f}s, "
+          f"Avg Loss: {avg_epoch_loss:.4f}, "
+          f"Avg Acc: {avg_accuracy:.3f}, "
+          f"Avg PPL: {avg_perplexity:.2f}"
+        )
+
+        # Save checkpoint every epoch
+        self.save_checkpoint()
+
+    except KeyboardInterrupt:
+      self.logger.info("Training interrupted by user")
+    except Exception as e:
+      self.logger.error(f"Training failed: {e}")
+      raise
+    finally:
+      # Final save and cleanup
+      self.save_checkpoint()
+      total_time = time.time() - start_time
+      
+      self.logger.info(f"Training completed in {total_time:.2f}s")
+      self.logger.info(f"Best validation loss: {best_val_loss:.4f}")
+      
+      self.writer.close()
+      
+      # Save training summary
+      summary = {
+        'total_time': total_time,
+        'best_val_loss': best_val_loss,
+        'total_steps': self.global_step,
+        'final_epoch': self.epoch,
+        'model_params': f"{self.n_params:.2f}M",
+        'training_history': self.training_history
+      }
+      
+      with open(self.save_dir / 'training_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
 
 def main():
-  """Main training function"""
-  # configuration
-  config_path = "config.json"
-  model_name = "AVA_500M"  # change this to "AVA_750M" or "AVA_1B" as needed
+  """Example training setup"""
   
-  # google-drive dataset URL (replace with your actual URL)
-  dataset_url = "https://drive.google.com/"
-  dataset_path = "/teamspace/uploads/dataset.txt"
-
-  # load configurations
-  print("Loading configurations...")
-  model_config, train_config = load_config(config_path, model_name)
-
-  # set device
-  device = train_config['device']
-  if device == 'cuda' and not torch.cuda.is_available():
-    device = 'cpu'
-    print("CUDA not available, using CPU")
+  dataset_paths = [
+    "data/dataset1.txt",
+    "data/dataset2.txt"
+  ]
+  dataset_names = ["dataset1", "dataset2"]
   
-  print(f"Using device: {device}")
-
-  # setting random seeds for reproducibility
-  torch.manual_seed(1337)
-  if device == 'cuda':
-    torch.cuda.manual_seed(1337)
-
-  # downloading and preparing dataset
-  train_data, val_data = prepare_dataset(dataset_path)
-  print("Initializing model...")
-
-  # create a params object with the configuration
-  class ModelConfig:
-    def __init__(self, config_dict):
-      for key, value in config_dict.items():
-        setattr(self, key, value)
-  
-  params = ModelConfig(model_config)
-  model = TransformerMoE(params=params, vocab_size=model_config['vocab_size'])
-  model.to(device)
-  
-  # print model information
-  print_model_info(model, model_config)
-
-  # configure optimizer
-  optimizer = configure_optimizers(
-    model, 
-    weight_decay=train_config['weight_decay'],
-    learning_rate=train_config['learning_rate'],
-    betas=(train_config['beta1'], train_config['beta2'])
+  # Initialize trainer
+  trainer = MultiTrainer(
+    config_path="config.json",
+    model_name="AVA_500M",  # or "AVA_750M", "AVA_1B"
+    dataset_path=dataset_paths,
+    dataset_names=dataset_names,
+    save_dir="checkpoints",
+    log_dir="logs",
+    encoding="gpt2",
+    device="cuda"
   )
 
-  # compiling model for faster training (PyTorch 2.0+)
-  # Disable compilation initially to debug the error
-  compile_model = train_config.get('compile', False)
-  if compile_model:
-    print("Model compilation disabled for debugging. Enable after fixing issues.")
-    # print("Compiling model...")
-    # try:
-    #   model = torch.compile(model)
-    #   print("Model compiled successfully!")
-    # except:
-    #   print("Model compilation failed, continuing without compilation")
-  
-  # Training setup
-  scaler = torch.amp.GradScaler(enabled=(device == 'cuda' and train_config.get('dtype') == 'bfloat16'))
-  
-  # Fix autocast context
-  if device == 'cuda':
-    ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-  else:
-    ctx = nullcontext()
-  
-  # Training parameters
-  max_iters = train_config.get('max_iters', 600000)
-  batch_size = train_config['batch_size']
-  block_size = train_config['block_size']
-  gradient_accumulation_steps = train_config.get('gradient_accumulation_steps', 1)
-  grad_clip = train_config.get('grad_clip', 1.0)
-  eval_interval = train_config['eval_interval']
-  eval_iters = train_config['eval_iters']
-  log_interval = train_config.get('log_interval', 1)
-  
-  # Learning rate schedule parameters
-  warmup_steps = train_config['warmup_steps']
-  lr_decay_steps = train_config['lr_decay_steps']
-  learning_rate = train_config['learning_rate']
-  min_lr = train_config['min_lr']
-  
-  print(f"\nStarting training for {max_iters:,} iterations...")
-  print(f"Batch size: {batch_size}, Block size: {block_size}")
-  print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
-  print(f"Effective batch size: {batch_size * gradient_accumulation_steps}")
-  
-  # Training loop
-  model.train()
-  step = 0
-  start_time = time.time()
-  
-  # Initial evaluation
-  try:
-    losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
-    print(f"\nStep {step:6d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | " f"Train Acc: {losses['train_acc']:.3f} | Val Acc: {losses['val_acc']:.3f}")
-  except Exception as e:
-    print(f"Initial evaluation failed: {e}")
-    print("Continuing with training...")
-  
-  while step < max_iters:
-    try:
-      lr = get_lr(step, warmup_steps, lr_decay_steps, learning_rate, min_lr)
-      for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-      
-      # Evaluate and log
-      if step % eval_interval == 0 and step > 0:
-        try:
-          losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
-          elapsed_time = time.time() - start_time
-          avg_time_per_step = elapsed_time / step if step > 0 else 0
-          
-          print(f"Step {step:6d} | Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f} | " f"Train Acc: {losses['train_acc']:.3f} | Val Acc: {losses['val_acc']:.3f} | " f"LR: {lr:.2e} | Time/Step: {avg_time_per_step:.2f}s")
-        except Exception as e:
-          print(f"Evaluation failed at step {step}: {e}")
-
-      # Training step
-      optimizer.zero_grad(set_to_none=True)
-      loss_accum = 0.0
-      
-      for micro_step in range(gradient_accumulation_steps):
-        X, Y = get_batch(train_data, batch_size, block_size, device)
-        
-        with ctx:
-          logits, loss, _ = model(X, Y)
-          loss = loss / gradient_accumulation_steps
-          loss_accum += loss.detach()
-        
-        scaler.scale(loss).backward()
-      
-      # Gradient clipping
-      if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-      
-      # Optimizer step
-      scaler.step(optimizer)
-      scaler.update()
-      
-      step += 1
-      
-      # Log training progress
-      if step % log_interval == 0:
-        elapsed_time = time.time() - start_time
-        avg_time_per_step = elapsed_time / step
-        print(f"Step {step:6d} | Loss: {loss_accum:.4f} | LR: {lr:.2e} | Time/Step: {avg_time_per_step:.2f}s")
-        
-    except Exception as e:
-      print(f"Training error at step {step}: {e}")
-      print("Stopping training...")
-      break
-  
-  print(f"\nTraining completed! Total time: {(time.time() - start_time) / 3600:.2f} hours")
-  
-  # Save final model
-  checkpoint = {
-    'model_state_dict': model.state_dict(),
-    'optimizer_state_dict': optimizer.state_dict(),
-    'model_config': model_config,
-    'train_config': train_config,
-    'step': step,
-  }
-  
-  torch.save(checkpoint, f'{model_name}_final.pt')
-  print(f"Model saved as {model_name}_final.pt")
-  
-  # Final evaluation
-  try:
-    losses = estimate_loss(model, train_data, val_data, eval_iters, batch_size, block_size, device)
-    print(f"\nFinal Results:")
-    print(f"Train Loss: {losses['train']:.4f} | Val Loss: {losses['val']:.4f}")
-    print(f"Train Accuracy: {losses['train_acc']:.3f} | Val Accuracy: {losses['val_acc']:.3f}")
-  except Exception as e:
-    print(f"Final evaluation failed: {e}")
+  # Start training
+  trainer.train()
 
 if __name__ == "__main__":
   main()
