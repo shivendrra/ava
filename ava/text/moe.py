@@ -1,219 +1,409 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
-class ModelArgs:
-  d_model:int = 1024
-  n_layers:int = 12
-  n_heads:int = 18
-  n_ff_multiple:int = 10
-  fnn_multiplier:int = 4
-  n_ff:int = n_ff_multiple * d_model
-  dropout:float = 0.2
-  norm_eps:float = 1e-5
-  block_size:int = 1024
-  n_experts:int = 4
-  top_k:int = 2
-  device: str = "cuda" if torch.cuda.is_available() else "cpu"
+import math
 
 class RMSNorm(nn.Module):
-  def __init__(self, dim:int, eps:float=1e-5):
+  def __init__(self, dim: int, eps: float = 1e-5):
     super().__init__()
-    self.eps, self.weight = eps, nn.Parameter(torch.ones(dim))
+    self.eps = eps
+    self.weight = nn.Parameter(torch.ones(dim))
+  
   def _norm(self, x):
     return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+  
   def forward(self, x):
     out = self._norm(x.float()).type_as(x)
     return out * self.weight
 
 class SwiGLU(nn.Module):
-  """
-    swiglu activation function
-      SwiGLU(x,W,V,b,c,b) = Swish b(xW + b) * (xV + c)
-    paper: https://paperswithcode.com/method/swiglu
-  """
-  def __init__(self, w1:torch.tensor, w2:torch.tensor, w3:torch.tensor) -> None:
+  def __init__(self, in_dim, hidden_dim):
     super().__init__()
-    self.w1, self.w2 = w1, w2
+    self.proj = nn.Linear(in_dim, 2 * hidden_dim, bias=False)
+
   def forward(self, x):
-    x1 = F.linear(x, self.w1.weight)
-    x2 = F.linear(x, self.w2.weight)
+    x_proj = self.proj(x)
+    x1, x2 = x_proj.chunk(2, dim=-1)
     return F.silu(x1) * x2
 
-class RoPE(nn.Module):
-  def __init__(self, head_size, block_size):
+def rotate_half(x):
+  x1, x2 = x.chunk(2, dim=-1)
+  return torch.cat((-x2, x1), dim=-1)
+
+def apply_rope_x(x, cos, sin):
+  return (x * cos) + (rotate_half(x) * sin)
+
+class MLA(nn.Module):
+  def __init__(self, d_model, n_heads, max_len=1024, rope_theta=10000.0):
     super().__init__()
-    self.head_size = head_size
-    self.block_size = block_size
-    inv_freq = 1.0 / (10000 ** (torch.arange(0, head_size, 2).float() / head_size))
-    position = torch.arange(0, self.block_size, dtype=torch.float, device=self.cos_emb.device).unsqueeze(1)  # (block_size, 1)
-    sinusoidal = torch.einsum("i,j->ij", position, inv_freq)  # Shape: (block_size, head_size // 2)
-    self.register_buffer("cos_emb", sinusoidal.cos(), persistent=False)  # (block_size, head_size // 2)
-    self.register_buffer("sin_emb", sinusoidal.sin(), persistent=False)  # (block_size, head_size // 2)
+    self.d_model = d_model
+    self.n_heads = n_heads
+    self.dh = d_model // n_heads
+    self.qk_nope_dim = self.dh // 2
+    self.qk_rope_dim = self.dh - self.qk_nope_dim
 
-  def forward(self, q, k):
-    # spliting tensors into even and odd components
-    q1, q2 = q[..., ::2], q[..., 1::2]
-    k1, k2 = k[..., ::2], k[..., 1::2]
-    assert q.size(-1) == self.head_size, f"Query size mismatch: {q.size(-1)} != {self.head_size}"
-    assert k.size(-1) == self.head_size, f"Key size mismatch: {k.size(-1)} != {self.head_size}"
-    # retrieving embeddings for current sequence length
-    cos = self.cos_emb[:q.shape[1], :].unsqueeze(0).to(q.device)
-    sin = self.sin_emb[:q.shape[1], :].unsqueeze(0).to(q.device)
+    self.q_proj = nn.Linear(d_model, d_model, bias=False)
+    self.k_proj = nn.Linear(d_model, d_model, bias=False)
+    self.v_proj = nn.Linear(d_model, d_model, bias=False)
+    self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
-    # applying rotations
-    q_rot = torch.cat([q1 * cos - q2 * sin, q1 * sin + q2 * cos], dim=-1)
-    k_rot = torch.cat([k1 * cos - k2 * sin, k1 * sin + k2 * cos], dim=-1)
-    return q_rot, k_rot
+    # Pre-compute and cache RoPE embeddings
+    rope_dim = self.qk_rope_dim
+    if rope_dim > 0:
+      freqs = 1.0 / (rope_theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
+      emb = torch.outer(torch.arange(max_len).float(), freqs)
+      cos_cached = emb.cos()[None, None, :, :]
+      sin_cached = emb.sin()[None, None, :, :]
+    else:
+      cos_cached = torch.zeros(1, 1, max_len, 1)
+      sin_cached = torch.zeros(1, 1, max_len, 1)
 
-class Head(nn.Module):
-  def __init__(self, head_size, d_model, dropout, block_size, mask=False):
-    super().__init__()
-    self.key = nn.Linear(d_model, head_size, bias=True)
-    self.query = nn.Linear(d_model, head_size, bias=True)
-    self.value = nn.Linear(d_model, head_size, bias=True)
-    self.dropout = nn.Dropout(dropout)
-    self.mask = mask
-    if mask:
-      self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
-    self.pos_emb = RoPE(head_size, block_size)
-  def forward(self, x):
-    B, T, C = x.shape
-    key, query, value = self.key(x), self.query(x), self.value(x)
-    query, key = self.pos_emb(query, key)
-    scores = torch.matmul(query, key.transpose(-2, -1)) / (key.shape[-1] ** 0.5)
-    if T > self.tril.size(0):
-      self.tril = torch.tril(torch.ones(T, T, device=scores.device))
-    scores = scores.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-    attention = self.dropout(F.softmax(scores, dim=-1))
-    output = torch.matmul(attention, value)
-    return output
+    self.register_buffer("cos_cached", cos_cached, persistent=False)
+    self.register_buffer("sin_cached", sin_cached, persistent=False)
 
-class MultiHeadAttention(nn.Module):
-  def __init__(self, d_model, dropout, n_head, block_size, mask):
-    head_size = d_model // n_head
-    super().__init__()
-    self.heads = nn.ModuleList(
-      [Head(head_size, d_model, dropout, block_size, mask) for _ in range(n_head)]
-    )
-    self.proj = nn.Linear(n_head * head_size, d_model)
-    self.dropout = nn.Dropout(dropout)
-  def forward(self, x):
-    out = torch.cat([h(x) for h in self.heads], dim=-1)
-    out = self.dropout(self.proj(out))
-    return out
+  def forward(self, x, kv_cache=None, past_length=0, is_causal=True):
+    B, S, D = x.size()
+
+    # Validate input dimensions
+    assert D == self.d_model, f"Input dim {D} != model dim {self.d_model}"
+    assert S <= self.cos_cached.size(2), f"Sequence length {S} > max_len {self.cos_cached.size(2)}"
+
+    # More memory efficient projections
+    Q = self.q_proj(x).view(B, S, self.n_heads, self.dh).transpose(1, 2)
+    K = self.k_proj(x).view(B, S, self.n_heads, self.dh).transpose(1, 2)
+    V = self.v_proj(x).view(B, S, self.n_heads, self.dh).transpose(1, 2)
+
+    # Split Q and K for RoPE
+    if self.qk_rope_dim > 0:
+      Q_nope, Q_rope = torch.split(Q, [self.qk_nope_dim, self.qk_rope_dim], dim=-1)
+      K_nope, K_rope = torch.split(K, [self.qk_nope_dim, self.qk_rope_dim], dim=-1)
+    else:
+      Q_nope, Q_rope = Q, torch.empty_like(Q[:, :, :, :0])
+      K_nope, K_rope = K, torch.empty_like(K[:, :, :, :0])
+
+    # Handle KV cache more efficiently
+    if kv_cache is not None:
+      past_K_nope, past_K_rope, past_V = kv_cache
+      K_nope = torch.cat([past_K_nope, K_nope], dim=2)
+      if self.qk_rope_dim > 0:
+        K_rope = torch.cat([past_K_rope, K_rope], dim=2)
+      V = torch.cat([past_V, V], dim=2)
+
+    S_full = K_nope.size(2)
+
+    # Apply RoPE more efficiently
+    if self.qk_rope_dim > 0:
+      rope_dim_half = self.qk_rope_dim // 2
+      
+      # Ensure indices are within bounds
+      start_pos = max(0, min(past_length, self.cos_cached.size(2) - S))
+      end_pos = min(start_pos + S, self.cos_cached.size(2))
+      start_full = min(S_full, self.cos_cached.size(2))
+      
+      if end_pos > start_pos and rope_dim_half > 0:
+        cos_q = self.cos_cached[:, :, start_pos:end_pos, :rope_dim_half]
+        sin_q = self.sin_cached[:, :, start_pos:end_pos, :rope_dim_half]
+        
+        # Ensure shapes match
+        if cos_q.size(2) == S:
+          cos_q = cos_q.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
+          sin_q = sin_q.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
+          Q_rope = apply_rope_x(Q_rope, cos_q, sin_q)
+
+        cos_k = self.cos_cached[:, :, :start_full, :rope_dim_half]
+        sin_k = self.sin_cached[:, :, :start_full, :rope_dim_half]
+        
+        if cos_k.size(2) == S_full:
+          cos_k = cos_k.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
+          sin_k = sin_k.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
+          K_rope = apply_rope_x(K_rope, cos_k, sin_k)
+
+    # Reconstruct Q and K
+    Q_final = torch.cat([Q_nope, Q_rope], dim=-1) if self.qk_rope_dim > 0 else Q_nope
+    K_final = torch.cat([K_nope, K_rope], dim=-1) if self.qk_rope_dim > 0 else K_nope
+
+    # Use PyTorch's optimized attention with proper error handling
+    try:
+      x = F.scaled_dot_product_attention(
+        Q_final, K_final, V, 
+        attn_mask=None, 
+        dropout_p=0.0 if not self.training else 0.1,
+        is_causal=is_causal and (past_length == 0)
+      )
+    except Exception as e:
+      # Fallback to manual attention if scaled_dot_product_attention fails
+      scale = 1.0 / math.sqrt(self.dh)
+      scores = torch.matmul(Q_final, K_final.transpose(-2, -1)) * scale
+      
+      if is_causal and past_length == 0:
+        mask = torch.tril(torch.ones(S, S_full, device=x.device, dtype=torch.bool))
+        scores = scores.masked_fill(~mask, float('-inf'))
+      
+      attn_weights = F.softmax(scores, dim=-1)
+      if self.training:
+        attn_weights = F.dropout(attn_weights, p=0.1)
+      x = torch.matmul(attn_weights, V)
+    
+    x = x.transpose(1, 2).reshape(B, S, D)
+    x = self.o_proj(x)
+    
+    # Return new cache only if needed
+    new_kv_cache = (K_nope, K_rope, V) if kv_cache is not None or past_length > 0 else None
+    return x, new_kv_cache
 
 class Expert(nn.Module):
-  def __init__(self, d_model, hidden_dim, multiple_of, ffn_multiplier, dropout) -> None:
+  def __init__(self, d_model, hidden_dim, dropout, ffn_multiplier=None):
     super().__init__()
     hidden_dim = int(2 * hidden_dim / 3)
     if ffn_multiplier is not None:
       hidden_dim = int(ffn_multiplier * hidden_dim)
-    hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-    self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
-    self.w2 = nn.Linear(hidden_dim, d_model, bias=False)
+    hidden_dim = max(1, hidden_dim)  # Ensure positive dimension
+    
+    self.swiglu = SwiGLU(d_model, hidden_dim)
+    self.fc = nn.Linear(hidden_dim, d_model, bias=False)
     self.dropout = nn.Dropout(dropout)
-    self.swiglu = SwiGLU(self.w1, self.w2)
+
   def forward(self, x):
-    x = self.swiglu(self.w1(x))
-    return self.dropout(self.w2(x))
+    x = self.swiglu(x)
+    return self.dropout(self.fc(x))
 
 class NoisyTopkRouter(nn.Module):
-  def __init__(self, n_embed, n_experts, top_k) -> None:
+  def __init__(self, n_embed, n_experts, top_k):
     super().__init__()
-    self.top_k = top_k
-    # layer for router logits
-    self.topkroute_linear = nn.Linear(n_embed, n_experts)
-    self.noise_linear = nn.Linear(n_embed, n_experts)
-  def forward(self, mh_output):
-    # mh_ouput is the output tensor from multihead self attention block
-    logits = self.topkroute_linear(mh_output)
-    # noise logits
-    noise_logits = self.noise_linear(mh_output)
-    # adding scaled unit gaussian noise to the logits
-    noise = torch.randn_like(logits)*F.softplus(noise_logits)
-    noisy_logits = logits + noise
-    top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
+    self.top_k = min(top_k, n_experts)  # Ensure top_k doesn't exceed n_experts
+    self.n_experts = n_experts
+    self.topkroute_linear = nn.Linear(n_embed, n_experts, bias=False)
+    self.noise_linear = nn.Linear(n_embed, n_experts, bias=False)
+
+  def forward(self, x):
+    # More memory efficient routing
+    logits = self.topkroute_linear(x)
+    
+    if self.training and self.n_experts > 1:
+      noise_logits = self.noise_linear(x)
+      noise = torch.randn_like(logits) * F.softplus(noise_logits.clamp(max=10.0))
+      noisy_logits = logits + noise
+    else:
+      noisy_logits = logits
+    
+    # Ensure valid top_k operation
+    if self.n_experts == 1:
+      top_k_logits = noisy_logits
+      indices = torch.zeros_like(noisy_logits, dtype=torch.long)
+    else:
+      top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
+    
+    # Create sparse logits more safely
     zeros = torch.full_like(noisy_logits, float('-inf'))
     sparse_logits = zeros.scatter(-1, indices, top_k_logits)
     router_output = F.softmax(sparse_logits, dim=-1)
+    
     return router_output, indices
 
 class SparseMoE(nn.Module):
-  def __init__(self, d_model, n_experts, top_k, capacity_factor=1.0) -> None:
+  def __init__(self, d_model, n_experts, top_k, n_ff, dropout, ffn_multiplier, capacity_factor=1.25):
     super().__init__()
-    self.router = NoisyTopkRouter(d_model, n_experts, top_k)
-    self.experts = nn.ModuleList([Expert(d_model) for _ in range(n_experts)])
-    self.top_k, self.capacity_factor, self.n_experts = top_k, capacity_factor, n_experts
+    self.n_experts = max(1, n_experts)
+    self.top_k = min(top_k, self.n_experts)
+    
+    self.router = NoisyTopkRouter(d_model, self.n_experts, self.top_k)
+    self.experts = nn.ModuleList([
+      Expert(d_model, n_ff, dropout, ffn_multiplier) 
+      for _ in range(self.n_experts)
+    ])
+    self.capacity_factor = capacity_factor
+
   def forward(self, x):
-    batch_size, seq_len, _ = x.shape
+    batch_size, seq_len, d_model = x.shape
+    original_shape = x.shape
+    
+    # Handle single expert case
+    if self.n_experts == 1:
+      return self.experts[0](x)
+    
+    # Flatten input for processing
+    flat_x = x.view(-1, d_model)
+    
+    # Get routing decisions
     gating_output, indices = self.router(x)
-    final_output = torch.zeros_like(x)
+    flat_gating_output = gating_output.view(-1, self.n_experts)
+    flat_indices = indices.view(-1, self.top_k)
 
-    flat_x = x.view(-1, x.size(-1))
-    flat_gating_output = gating_output.view(-1, gating_output.size(-1))
-    tokens_per_batch = batch_size * seq_len * self.top_k
-    expert_capacity = int((tokens_per_batch / self.n_experts) * self.capacity_factor)
-    updates = torch.zeros(flat_x)
+    # Initialize output tensor
+    final_output = torch.zeros_like(flat_x)
+    
+    # Calculate expert capacity more conservatively
+    total_tokens = flat_x.size(0)
+    tokens_per_expert = max(1, (total_tokens * self.top_k) // self.n_experts)
+    expert_capacity = max(8, int(tokens_per_expert * self.capacity_factor))
 
-    for i, expert in enumerate(self.experts):
-      expert_mask = (indices == i).any(dim=-1)
-      flat_mask = expert_mask.view(-1)
-      selected_indices = torch.nonzero(flat_mask).squeeze(-1)
-      limited_indices = selected_indices[:expert_capacity] if selected_indices.numel() > expert_capacity else selected_indices
-      if limited_indices.numel() > 0:
-        expert_inputs = flat_x[limited_indices]
-        expert_output = expert(expert_inputs)
-        gating_scores = flat_gating_output[limited_indices, i].unsqueeze(1)
-        weighted_outputs = expert_output * gating_scores
-        updates.index_add_(0, limited_indices, weighted_outputs)
+    # Process each expert more safely
+    for expert_idx in range(self.n_experts):
+      # Find tokens assigned to this expert
+      expert_mask = (flat_indices == expert_idx).any(dim=-1)
+      expert_tokens = torch.nonzero(expert_mask, as_tuple=False).squeeze(-1)
 
-    final_outputs += updates.view(batch_size, seq_len, -1)
-    return final_outputs
+      if expert_tokens.numel() == 0:
+        continue
+        
+      # Apply capacity limit to prevent OOM
+      if expert_tokens.numel() > expert_capacity:
+        # Randomly sample tokens to maintain diversity
+        perm = torch.randperm(expert_tokens.numel(), device=expert_tokens.device)
+        expert_tokens = expert_tokens[perm[:expert_capacity]]
+      
+      # Ensure indices are valid
+      expert_tokens = expert_tokens[expert_tokens < flat_x.size(0)]
+      
+      if expert_tokens.numel() == 0:
+        continue
+      
+      try:
+        # Process tokens through expert
+        expert_input = flat_x[expert_tokens]
+        expert_output = self.experts[expert_idx](expert_input)
+        
+        # Get gating weights for these tokens - use advanced indexing more safely
+        expert_gating = flat_gating_output[expert_tokens]
+        gating_weights = expert_gating[:, expert_idx:expert_idx+1]
+        weighted_output = expert_output * gating_weights
+        
+        # Add to final output using scatter_add for memory efficiency
+        final_output.scatter_add_(0, expert_tokens.unsqueeze(-1).expand_as(weighted_output), weighted_output)
+        
+      except Exception as e:
+        # Skip this expert if there's an error to prevent training crash
+        continue
 
-class Block(nn.Modules):
-  def __init__(self, d_model, n_head, n_experts, top_k, dropout, block_size) -> None:
+    return final_output.view(original_shape)
+
+class Block(nn.Module):
+  def __init__(self, d_model, n_heads, n_experts, top_k, n_ff, dropout, ffn_multiplier, block_size, capacity_factor, rope_theta=10000.0):
     super().__init__()
-    self.sa = MultiHeadAttention(d_model, dropout, n_head, block_size, True)
-    self.smoe = SparseMoE(d_model, n_experts, top_k)
+    self.self_attn = MLA(d_model, n_heads, block_size, rope_theta)
+    self.cross_attn = MLA(d_model, n_heads, block_size, rope_theta) if n_experts > 0 else None
+    self.moe = SparseMoE(d_model, n_experts, top_k, n_ff, dropout, ffn_multiplier, capacity_factor)
     self.ln1 = RMSNorm(d_model)
     self.ln2 = RMSNorm(d_model)
-  def forward(self, x):
-    x = x + self.sa((self.ln1(x)))
-    x = x + self.smoe(self.ln2(x))
-    return x
+    self.ln3 = RMSNorm(d_model) if self.cross_attn is not None else None
+
+  def forward(self, x, encoder_output=None, self_attn_cache=None, cross_attn_cache=None, past_length=0):
+    # Self-attention with residual connection
+    attn_out, new_self_cache = self.self_attn(
+      self.ln1(x), 
+      kv_cache=self_attn_cache, 
+      past_length=past_length, 
+      is_causal=True
+    )
+    x = x + attn_out
+
+    # Cross-attention (if encoder output is provided)
+    new_cross_cache = None
+    if encoder_output is not None and self.cross_attn is not None:
+      cross_out, new_cross_cache = self.cross_attn(
+        self.ln2(x), 
+        kv_cache=cross_attn_cache, 
+        past_length=0, 
+        is_causal=False
+      )
+      x = x + cross_out
+      norm_input = self.ln3(x)
+    else:
+      norm_input = self.ln2(x)
+
+    # MoE layer with residual connection
+    moe_out = self.moe(norm_input)
+    x = x + moe_out
+
+    return x, new_self_cache, new_cross_cache
 
 def kaiming_init_weights(m):
-  if isinstance (m, (nn.Linear)): nn.init.kaiming_normal_(m.weight)
+  if isinstance(m, nn.Linear):
+    nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+    if m.bias is not None:
+      nn.init.zeros_(m.bias)
 
 class TransformerMoE(nn.Module):
-  def __init__(self, params: ModelArgs, vocab_size: int):
+  def __init__(self, params, vocab_size: int):
     super().__init__()
     self.block_size = params.block_size
     self.d_model = params.d_model
     self.n_layers = params.n_layers
+    self.vocab_size = vocab_size
+    
+    # Validate parameters
+    assert vocab_size > 0, f"vocab_size must be positive, got {vocab_size}"
+    assert self.d_model > 0, f"d_model must be positive, got {self.d_model}"
+    assert self.block_size > 0, f"block_size must be positive, got {self.block_size}"
+    
+    # Token embeddings
     self.token_embeddings = nn.Embedding(vocab_size, self.d_model)
-    self.blocks = nn.ModuleList([Block(d_model=params.d_model, n_head=params.n_heads, n_experts=params.n_experts, top_k=params.top_k, dropout=params.dropout, block_size=params.block_size) for _ in range(self.n_layers)])
-    self.norm_final = RMSNorm(self.d_model, params.norm_eps)
-    self.linear_final = nn.Linear(self.d_model, vocab_size, bias=False)
+    
+    # Transformer blocks
+    self.blocks = nn.ModuleList([
+      Block(
+        params.d_model, params.n_heads, params.n_experts, params.top_k, 
+        params.n_ff, params.dropout, params.ffn_multiplier, 
+        params.block_size, params.capacity_factor, params.rope_theta
+      ) for _ in range(self.n_layers)
+    ])
+    
+    # Final layer norm and output projection
+    self.norm_final = RMSNorm(self.d_model, getattr(params, 'norm_eps', 1e-5))
+    self.lm_head = nn.Linear(self.d_model, vocab_size, bias=False)
+    
+    # Initialize weights
     self.apply(kaiming_init_weights)
+    
+    # Scale down the output layer for better training stability
+    with torch.no_grad():
+      self.lm_head.weight *= 0.1
 
-  def forward(self, idx, targets=None):
+  def forward(self, idx, targets=None, encoder_output=None, kv_caches=None, past_length=0):
     B, T = idx.size()
-    x = self.token_embeddings(idx)  # Shape: (B, T, d_model)
-    # through decoder layers
-    for layer in self.blocks:
-      x = layer(x)
+    
+    # Validate inputs
+    if torch.any(idx >= self.vocab_size) or torch.any(idx < 0):
+      raise ValueError(f"Input indices out of range: min={idx.min().item()}, max={idx.max().item()}, vocab_size={self.vocab_size}")
+    
+    if T > self.block_size:
+      raise ValueError(f"Input sequence length ({T}) exceeds block size ({self.block_size})")
+    
+    # Token embeddings
+    x = self.token_embeddings(idx)
 
-    # final normalization and projection
+    # Initialize KV caches if not provided
+    if kv_caches is None:
+      kv_caches = [(None, None) for _ in range(self.n_layers)]
+
+    # Forward pass through transformer blocks
+    new_kv_caches = []
+    for i, block in enumerate(self.blocks):
+      self_cache, cross_cache = kv_caches[i]
+      x, new_self_cache, new_cross_cache = block(
+        x, encoder_output, self_cache, cross_cache, past_length
+      )
+      new_kv_caches.append((new_self_cache, new_cross_cache))
+
+    # Final layer norm and output projection
     x = self.norm_final(x)
-    logits = self.linear_final(x)  # Shape: (B, T, vocab_size)
+    logits = self.lm_head(x)
 
-    # compute loss if targets are there
+    # Calculate loss if targets are provided
     loss = None
     if targets is not None:
-      B, T, C = logits.shape
-      logits = logits.view(B * T, C)
-      targets = targets.view(B * T)
-      loss = F.cross_entropy(logits, targets)
-    return logits, loss
+      # Validate targets
+      if torch.any(targets >= self.vocab_size) or torch.any(targets < -1):
+        valid_mask = (targets >= 0) & (targets < self.vocab_size)
+        if not valid_mask.all():
+          print(f"Warning: Invalid target indices found, clamping to valid range")
+          targets = torch.clamp(targets, 0, self.vocab_size - 1)
+      
+      # Cross-entropy loss
+      loss = F.cross_entropy(
+        logits.view(-1, logits.size(-1)), 
+        targets.view(-1),
+        ignore_index=-1  # Ignore padding tokens if any
+      )
+
+    return logits, loss, new_kv_caches

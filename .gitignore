@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 test data/
 
+dataset/
+ava/model/
+
 # Distribution / packaging
 .Python
 develop-eggs/

@@ -1,90 +1,447 @@
-"""
-  @run.py
-  - contains training logic for text model(for now)
-  working:
-    - imports vatious dependencies first, and then loads the training data
-    - tokenizes it, per-character basis
-    - loads the required hyper-parameters and the model file
-    - trains it till 'max_iters' and saves the model state, and generates outputs
-"""
-
-import os, json, torch
-current_directory = os.path.dirname(os.path.abspath(__file__))
-os.chdir(current_directory)
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-with open('../datasets/wiki_176m.txt', 'r', encoding='utf-8') as file:
-  data = file.read()
-print(f"{(len(data)/1e6):.2f} million letters")
-
-from .text.tokenizer import Tokenizer
-tokenizer = Tokenizer()
-vocab_size = tokenizer.get_vocab()
-
-data = torch.tensor(tokenizer.encode(data), dtype=torch.long)
-n = int(0.9*len(data)) # first 90% will be train, rest val
-train_data = data[:n]
-val_data = data[n:]
-
-with open('config.json', 'r', encoding='utf-8') as file:
-  params = json.load(file)
-
-batch_size = params['batch_size']
-block_size = params['block_size']
-max_iters = 1000
-eval_interval = 100
-eval_iters = 200
-learning_rate = params['learning_rate']
-
-torch.manual_seed(1400)
-
-def get_batch(split):
-  data = train_data if split == 'train' else val_data
-  ix = torch.randint(len(data) - block_size, (batch_size,))
-  x = torch.stack([data[i:i+block_size] for i in ix])
-  y = torch.stack([data[i+1:i+block_size+1] for i in ix])
-  x, y = x.to(device), y.to(device)
-  return x, y
-
-@torch.no_grad()
-def estimate_loss():
-  out = {}
-  model.eval()
-  for split in ['train', 'val']:
-    losses = torch.zeros(eval_iters)
-    for k in range(eval_iters):
-        X, Y = get_batch(split)
-        logits, loss = model(X, Y)
-        losses[k] = loss.item()
-    out[split] = losses.mean()
-  model.train()
-  return out
+from datetime import datetime
+from typing import Dict, Any, Tuple, List, Optional
+import torch
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import json, time, logging, gc
+from pathlib import Path
+import numpy as np
+import tiktoken
 
 from .text.moe import TransformerMoE
-model = TransformerMoE(vocab_size)
-m = model.to(device)
+from .dataset import Dataset
 
-n_param = sum(p.numel() for p in m.parameters())/1e6
-print(f"{n_param:.2f} million")
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-steps = []
-train_losses = []
-val_losses = []
+class EarlyStopping:
+  """Early stopping utility"""
+  def __init__(self, patience: int = 7, min_delta: float = 0.001):
+    self.patience = patience
+    self.min_delta = min_delta
+    self.counter = 0
+    self.best_loss = float('inf')
 
-for iter in range(max_iters):
+  def __call__(self, val_loss: float) -> bool:
+    if val_loss < self.best_loss - self.min_delta:
+      self.best_loss = val_loss
+      self.counter = 0
+      return False
+    else:
+      self.counter += 1
+      return self.counter >= self.patience
 
-  if iter % eval_interval == 0 or iter == max_iters - 1:
-    losses = estimate_loss()
-    print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+class Config:
+  """Configuration class for model parameters"""
+  def __init__(self, **kwargs):
+    for key, value in kwargs.items():
+      setattr(self, key, value)
 
-    steps.append(iter)
-    train_losses.append(losses['train'])
-    val_losses.append(losses['val'])
+class MultiTrainer:
+  def __init__(self, config_path: str, model_name: str, dataset_path: List[str], dataset_names: List[str], save_dir: str, log_dir: str, encoding: str = "gpt2", device: str = 'cuda'):
+    self.config_path = Path(config_path)
+    self.dataset_path = dataset_path
+    self.save_dir = Path(save_dir)
+    self.log_dir = Path(log_dir)
+    self.encoding = encoding
+    self.dataset_names = dataset_names
+    self.device = device
 
-  xb, yb = get_batch('train')
-  logits, loss = model(xb, yb)
-  optimizer.zero_grad(set_to_none=True)
-  loss.backward()
-  optimizer.step()
+    # Create directories
+    self.save_dir.mkdir(parents=True, exist_ok=True)
+    self.log_dir.mkdir(parents=True, exist_ok=True)
 
-torch.save(model.state_dict(), f'enigma_{n_param:.0f}m.pth')
+    # Setup logging
+    self.setup_logging()
+    
+    # Load datasets
+    self.datasets = {}
+    self.current_dataset_idx = 0
+    self.load_datasets()
+    
+    # Load configurations
+    self.model_config, self.train_config = self.load_config(model_name)
+    
+    # Initialize model
+    vocab_size = tiktoken.get_encoding(encoding).n_vocab
+    self.config = Config(**self.model_config)
+    self.model = TransformerMoE(self.config, vocab_size).to(device)
+    self.n_params = sum(p.numel() for p in self.model.parameters()) / 1e6
+    self.logger.info(f"Model initialized with {self.n_params:.2f}M parameters, vocab size: {vocab_size}")
+
+    # Training state
+    self.optimizer = None
+    self.scheduler = None
+    self.global_step = 0
+    self.epoch = 0
+    self.early_stopping = EarlyStopping(patience=10, min_delta=0.001)
+    self.training_history = []
+    self.writer = SummaryWriter(self.log_dir)
+
+  def setup_logging(self):
+    log_file = self.log_dir / f"training_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+      level=logging.INFO,
+      format='%(asctime)s - %(levelname)s - %(message)s',
+      handlers=[logging.FileHandler(log_file), logging.StreamHandler()]
+    )
+    self.logger = logging.getLogger(__name__)
+
+  def load_config(self, model_name: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    with open(self.config_path, 'r') as f:
+      configs = json.load(f)
+    
+    if isinstance(configs, list):
+      configs = configs[0]
+
+    if model_name not in configs:
+      raise ValueError(f"Model '{model_name}' not found in config. Available: {list(configs.keys())}")
+    
+    model_config = configs[model_name]['ModelConfig']
+    train_config = configs[model_name]['TrainConfig']
+    
+    return model_config, train_config
+
+  def load_datasets(self):
+    self.logger.info("Loading datasets...")
+    for path, name in zip(self.dataset_path, self.dataset_names):
+      try:
+        dataset = Dataset(path, self.encoding, 0.25, 1600)
+        self.datasets[name] = dataset
+        stats = dataset.get_data_stats()
+        self.logger.info(f"Dataset '{name}' loaded: {stats}")
+      except Exception as e:
+        self.logger.error(f"Failed to load dataset '{name}': {e}")
+        continue
+
+    if not self.datasets:
+      raise ValueError("No datasets loaded!")
+
+  def get_current_dataset(self) -> Dataset:
+    return self.datasets[self.dataset_names[self.current_dataset_idx]]
+
+  def switch_dataset(self):
+    self.current_dataset_idx = (self.current_dataset_idx + 1) % len(self.dataset_names)
+    current_name = self.dataset_names[self.current_dataset_idx]
+    self.logger.info(f"Switched to dataset: {current_name}")
+
+  def setup_training(self):
+    learning_rate = self.train_config.get('learning_rate', 6e-4)
+    weight_decay = self.train_config.get('weight_decay', 0.1)
+    beta1 = self.train_config.get('beta1', 0.9)
+    beta2 = self.train_config.get('beta2', 0.95)
+    
+    self.optimizer = optim.AdamW(
+      self.model.parameters(), 
+      lr=learning_rate,
+      weight_decay=weight_decay, 
+      betas=(beta1, beta2)
+    )
+
+    # Learning rate scheduler with warmup
+    warmup_steps = self.train_config.get('warmup_steps', 2000)
+    lr_decay_steps = self.train_config.get('lr_decay_steps', 600000)
+    min_lr = self.train_config.get('min_lr', 6e-5)
+    
+    def lr_lambda(step):
+      if step < warmup_steps:
+        return step / warmup_steps
+      # Cosine decay after warmup
+      progress = (step - warmup_steps) / (lr_decay_steps - warmup_steps)
+      return max(min_lr / learning_rate, 0.5 * (1 + np.cos(np.pi * progress)))
+
+    self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+    self.logger.info("Training setup completed")
+
+  def train_step(self, batch_size: int, block_size: int) -> Dict[str, float]:
+    self.model.train()
+    
+    # Get batch from current dataset
+    dataset = self.get_current_dataset()
+    try:
+      x, y = dataset.get_batch("train", batch_size, block_size, self.device)
+    except Exception as e:
+      self.logger.warning(f"Failed to get batch, switching dataset: {e}")
+      self.switch_dataset()
+      dataset = self.get_current_dataset()
+      x, y = dataset.get_batch("train", batch_size, block_size, self.device)
+
+    # Forward pass
+    self.optimizer.zero_grad()
+    
+    with torch.cuda.amp.autocast(enabled=self.train_config.get('dtype') == 'bfloat16'):
+      logits, loss, _ = self.model(x, targets=y)
+    
+    # Backward pass with gradient clipping
+    loss.backward()
+    grad_clip = self.train_config.get('grad_clip', 1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip)
+    self.optimizer.step()
+    self.scheduler.step()
+
+    # Compute metrics
+    with torch.no_grad():
+      # Accuracy
+      pred_tokens = torch.argmax(logits, dim=-1)
+      accuracy = (pred_tokens == y).float().mean()
+
+      # Perplexity
+      perplexity = torch.exp(loss)
+
+    return {
+      'loss': loss.item(),
+      'accuracy': accuracy.item(),
+      'perplexity': perplexity.item(),
+      'grad_norm': grad_norm.item(),
+      'lr': self.optimizer.param_groups[0]['lr']
+    }
+
+  def validate(self, batch_size: int, block_size: int, num_batches: int = 10) -> Dict[str, float]:
+    self.model.eval()
+    
+    val_metrics = {
+      'loss': 0.0,
+      'accuracy': 0.0,
+      'perplexity': 0.0
+    }
+    total_batches = 0
+
+    with torch.no_grad():
+      for dataset_name, dataset in self.datasets.items():
+        for _ in range(num_batches):
+          try:
+            x, y = dataset.get_batch("val", batch_size, block_size, self.device)
+            logits, loss, _ = self.model(x, targets=y)
+
+            # Compute metrics
+            pred_tokens = torch.argmax(logits, dim=-1)
+            accuracy = (pred_tokens == y).float().mean()
+            perplexity = torch.exp(loss)
+            
+            # Accumulate metrics
+            val_metrics['loss'] += loss.item()
+            val_metrics['accuracy'] += accuracy.item()
+            val_metrics['perplexity'] += perplexity.item()
+            
+            total_batches += 1
+            
+          except Exception as e:
+            self.logger.warning(f"Validation batch failed for {dataset_name}: {e}")
+            continue
+
+    # Average metrics
+    if total_batches > 0:
+      for key in val_metrics:
+        val_metrics[key] /= total_batches
+
+    return val_metrics
+
+  def save_checkpoint(self, is_best: bool = False):
+    checkpoint = {
+      'epoch': self.epoch,
+      'global_step': self.global_step,
+      'model_state_dict': self.model.state_dict(),
+      'optimizer_state_dict': self.optimizer.state_dict(),
+      'scheduler_state_dict': self.scheduler.state_dict(),
+      'model_config': self.model_config,
+      'train_config': self.train_config,
+      'training_history': self.training_history,
+      'current_dataset_idx': self.current_dataset_idx
+    }
+
+    filename = "best_model.pth" if is_best else f"checkpoint_epoch_{self.epoch:03d}.pth"
+    filepath = self.save_dir / filename
+
+    try:
+      torch.save(checkpoint, filepath)
+      self.logger.info(f"Checkpoint saved: {filepath}")
+      return str(filepath)
+    except Exception as e:
+      self.logger.error(f"Failed to save checkpoint: {e}")
+      return None
+
+  def load_checkpoint(self, checkpoint_path: str) -> bool:
+    try:
+      checkpoint = torch.load(checkpoint_path, map_location=self.device)
+      self.model.load_state_dict(checkpoint['model_state_dict'])
+      
+      if self.optimizer:
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+      if self.scheduler:
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+      self.epoch = checkpoint.get('epoch', 0)
+      self.global_step = checkpoint.get('global_step', 0)
+      self.training_history = checkpoint.get('training_history', [])
+      self.current_dataset_idx = checkpoint.get('current_dataset_idx', 0)
+      
+      self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
+      return True
+    except Exception as e:
+      self.logger.error(f"Failed to load checkpoint: {e}")
+      return False
+
+  def train(self, num_epochs: int = None, resume_from: Optional[str] = None):
+    # Use config values if not provided
+    if num_epochs is None:
+      num_epochs = self.train_config.get('epochs', 1)
+    
+    batch_size = self.train_config.get('batch_size', 12)
+    micro_batch_size = self.train_config.get('micro_batch_size', 4)
+    gradient_accumulation_steps = self.train_config.get('gradient_accumulation_steps', 3)
+    block_size = self.train_config.get('block_size', 1024)
+    eval_interval = self.train_config.get('eval_interval', 2000)
+    log_interval = self.train_config.get('log_interval', 1)
+    
+    # Setup training
+    self.setup_training()
+    
+    # Resume from checkpoint if provided
+    if resume_from:
+      self.load_checkpoint(resume_from)
+
+    self.logger.info("Starting training...")
+    self.logger.info(f"Parameters: epochs={num_epochs}, batch_size={batch_size}, "f"micro_batch_size={micro_batch_size}, block_size={block_size}")
+
+    try:
+      start_time = time.time()
+      best_val_loss = float('inf')
+
+      for epoch in range(self.epoch, num_epochs):
+        self.epoch = epoch
+        epoch_start_time = time.time()
+        epoch_losses = []
+        
+        # Calculate steps per epoch based on gradient accumulation
+        steps_per_epoch = 1000 // gradient_accumulation_steps
+        
+        for step in range(steps_per_epoch):
+          step_losses = []
+          
+          # Gradient accumulation loop
+          for micro_step in range(gradient_accumulation_steps):
+            metrics = self.train_step(micro_batch_size, block_size)
+            step_losses.append(metrics)
+          
+          # Average metrics across micro-batches
+          avg_metrics = {}
+          for key in step_losses[0].keys():
+            avg_metrics[key] = np.mean([m[key] for m in step_losses])
+          
+          epoch_losses.append(avg_metrics)
+          self.global_step += 1
+          
+          # Log to tensorboard
+          for key, value in avg_metrics.items():
+            self.writer.add_scalar(f'train/{key}', value, self.global_step)
+          
+          # Print progress
+          if self.global_step % log_interval == 0:
+            current_dataset = self.dataset_names[self.current_dataset_idx]
+            self.logger.info(f"Step {self.global_step}: Dataset={current_dataset}, "f"Loss={avg_metrics['loss']:.4f}, "f"Acc={avg_metrics['accuracy']:.3f}, "f"PPL={avg_metrics['perplexity']:.2f}, "f"LR={avg_metrics['lr']:.2e}")
+
+          # Validation
+          if self.global_step % eval_interval == 0:
+            val_metrics = self.validate(micro_batch_size, block_size)
+
+            # Log validation metrics
+            for key, value in val_metrics.items():
+              self.writer.add_scalar(f'val/{key}', value, self.global_step)
+
+            self.logger.info(f"Validation - Loss: {val_metrics['loss']:.4f}, "f"Acc: {val_metrics['accuracy']:.3f}, "f"PPL: {val_metrics['perplexity']:.2f}")
+            # Check for improvement
+            if val_metrics['loss'] < best_val_loss:
+              best_val_loss = val_metrics['loss']
+              self.save_checkpoint(is_best=True)
+              self.logger.info("New best model saved!")
+
+            # Early stopping check
+            if self.early_stopping(val_metrics['loss']):
+              self.logger.info("Early stopping triggered")
+              return
+          # Dataset rotation every 500 steps
+          if self.global_step % 500 == 0 and len(self.datasets) > 1:
+            self.switch_dataset()
+
+          # Memory cleanup
+          if self.global_step % 100 == 0:
+            gc.collect()
+            if torch.cuda.is_available():
+              torch.cuda.empty_cache()
+
+        # End of epoch
+        avg_epoch_loss = np.mean([m['loss'] for m in epoch_losses])
+        avg_accuracy = np.mean([m['accuracy'] for m in epoch_losses])
+        avg_perplexity = np.mean([m['perplexity'] for m in epoch_losses])
+        epoch_time = time.time() - epoch_start_time
+
+        self.training_history.append({
+          'epoch': epoch,
+          'avg_loss': avg_epoch_loss,
+          'avg_accuracy': avg_accuracy,
+          'avg_perplexity': avg_perplexity,
+          'epoch_time': epoch_time,
+          'global_step': self.global_step
+        })
+
+        self.logger.info(
+          f"Epoch {epoch + 1}/{num_epochs} completed in {epoch_time:.2f}s, "
+          f"Avg Loss: {avg_epoch_loss:.4f}, "
+          f"Avg Acc: {avg_accuracy:.3f}, "
+          f"Avg PPL: {avg_perplexity:.2f}"
+        )
+
+        # Save checkpoint every epoch
+        self.save_checkpoint()
+
+    except KeyboardInterrupt:
+      self.logger.info("Training interrupted by user")
+    except Exception as e:
+      self.logger.error(f"Training failed: {e}")
+      raise
+    finally:
+      # Final save and cleanup
+      self.save_checkpoint()
+      total_time = time.time() - start_time
+      
+      self.logger.info(f"Training completed in {total_time:.2f}s")
+      self.logger.info(f"Best validation loss: {best_val_loss:.4f}")
+      
+      self.writer.close()
+      
+      # Save training summary
+      summary = {
+        'total_time': total_time,
+        'best_val_loss': best_val_loss,
+        'total_steps': self.global_step,
+        'final_epoch': self.epoch,
+        'model_params': f"{self.n_params:.2f}M",
+        'training_history': self.training_history
+      }
+      
+      with open(self.save_dir / 'training_summary.json', 'w') as f:
+        json.dump(summary, f, indent=2)
+
+def main():
+  """Example training setup"""
+  
+  dataset_paths = [
+    "data/dataset1.txt",
+    "data/dataset2.txt"
+  ]
+  dataset_names = ["dataset1", "dataset2"]
+  
+  # Initialize trainer
+  trainer = MultiTrainer(
+    config_path="config.json",
+    model_name="AVA_500M",  # or "AVA_750M", "AVA_1B"
+    dataset_path=dataset_paths,
+    dataset_names=dataset_names,
+    save_dir="checkpoints",
+    log_dir="logs",
+    encoding="gpt2",
+    device="cuda"
+  )
+
+  # Start training
+  trainer.train()
+
+if __name__ == "__main__":
+  main()

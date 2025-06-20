@@ -6,15 +6,19 @@
 
 Building Ava from Ex-Machina using Language model paired audio engine to generate speech along with a vision model capabale of understanding human emotions &  . Using MoE to generated and understand speech, and then using vision models to identify and see physical things.
 
-Trained models can be downloaded from: [huggingface/ava-v1](https://huggingface.co/shivendrra/ava-v1)
+Trained models can be downloaded from: [huggingface/ava-v1](https://huggingface.co/shivendrra/ava)
 
-## Audio-Language Model
+## Call for sponser/donations
 
-A transformer based language MoE model fused with an audio engine, that could directly be trained on audio lanugage rather than on written data without even need of text data in any way. Still experimenting, will see what happens.
+This is supposed to be a big experimental project, trying to fuse two different types of data- audio & text togther while making the model feel like interacting to a sentient being.
 
-## Vision Model
+It needs to train different kinds of model- vision, audio & language (at-least 3 for now) & I've no source of income to fund compute units for this project. If you are interested in this project & rich, feel free to sponser this.
 
-Not yet decided, but I'll soon.
+Just add an Issue with tag `sponser` with your contact info or mail me at: shivharsh44@gmail.com
+
+## Language Model
+
+A transformer based language MoE model, using Deepseek's Latent Attention & RoPE for best preformance. Trained over ~20million tokenss(Still in training phase). Has around ~700M params & 2-Experts for now.
 
 ## Contribution
 
