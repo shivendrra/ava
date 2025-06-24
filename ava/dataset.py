@@ -91,17 +91,57 @@ class Dataset:
     if len(data) < block_size + 1:
       raise ValueError(f"Data length ({len(data)}) is less than block_size + 1 ({block_size + 1})")
 
-    torch.manual_seed(self.random_seed + hash(split_name) % 10000)  # Set random seed for reproducibility
-    random.seed(self.random_seed + hash(split_name) % 10000)  # Set random seed for reproducibility
-    max_start = len(data) - block_size  # Generate random starting indices
+    # Ensure we have enough data for the requested batch
+    min_required = batch_size * block_size + batch_size
+    if len(data) < min_required:
+      # Reduce batch_size to fit available data
+      max_batch_size = max(1, (len(data) - block_size) // block_size)
+      batch_size = min(batch_size, max_batch_size)
+      if batch_size <= 0:
+        raise ValueError(f"Not enough data for even one sample. Data length: {len(data)}, Block size: {block_size}")
+
+    torch.manual_seed(self.random_seed + hash(split_name) % 10000)
+    random.seed(self.random_seed + hash(split_name) % 10000)
+    
+    max_start = len(data) - block_size
     if max_start <= 0:
       raise ValueError("Block size is too large for available data")
+    
     idx = torch.randint(0, max_start, (batch_size,))
+    
     try:
-      # Create input and target sequences
-      x = torch.stack([data[i:i + block_size] for i in idx])
-      y = torch.stack([data[i + 1:i + block_size + 1] for i in idx])
+      # Create input and target sequences with proper error checking
+      x_list = []
+      y_list = []
+      
+      for i in idx:
+        start_idx = i.item()
+        if start_idx + block_size >= len(data):
+          start_idx = len(data) - block_size - 1
+        
+        x_seq = data[start_idx:start_idx + block_size]
+        y_seq = data[start_idx + 1:start_idx + block_size + 1]
+        
+        # Ensure sequences are the right length
+        if len(x_seq) != block_size or len(y_seq) != block_size:
+          continue
+          
+        x_list.append(x_seq)
+        y_list.append(y_seq)
+      
+      if not x_list:
+        raise ValueError("No valid sequences could be created")
+      
+      x = torch.stack(x_list)
+      y = torch.stack(y_list)
+      
+      # Final shape validation
+      expected_shape = (len(x_list), block_size)
+      if x.shape != expected_shape or y.shape != expected_shape:
+        raise ValueError(f"Unexpected batch shape: x={x.shape}, y={y.shape}, expected={expected_shape}")
+      
       return x.to(device), y.to(device)
+      
     except Exception as e:
       raise RuntimeError(f"Failed to create batch: {e}")
 

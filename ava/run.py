@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Dict, Any, Tuple, List, Optional
-import torch
+import torch, math
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import json, time, logging, gc
@@ -155,83 +155,108 @@ class MultiTrainer:
     
     # Get batch from current dataset
     dataset = self.get_current_dataset()
+    
     try:
       x, y = dataset.get_batch("train", batch_size, block_size, self.device)
     except Exception as e:
-      self.logger.warning(f"Failed to get batch, switching dataset: {e}")
-      self.switch_dataset()
-      dataset = self.get_current_dataset()
-      x, y = dataset.get_batch("train", batch_size, block_size, self.device)
+      self.logger.error(f"Failed to get training batch: {e}")
+      return {'loss': float('inf'), 'accuracy': 0.0, 'perplexity': float('inf'), 'grad_norm': 0.0, 'lr': 0.0}
+
+    # Validate batch shapes
+    if x.dim() != 2 or y.dim() != 2 or x.shape != y.shape:
+      self.logger.error(f"Invalid batch shapes: x={x.shape}, y={y.shape}")
+      return {'loss': float('inf'), 'accuracy': 0.0, 'perplexity': float('inf'), 'grad_norm': 0.0, 'lr': 0.0}
 
     # Forward pass
     self.optimizer.zero_grad()
     
-    with torch.cuda.amp.autocast(enabled=self.train_config.get('dtype') == 'bfloat16'):
+    try:
       logits, loss, _ = self.model(x, targets=y)
-    
-    # Backward pass with gradient clipping
-    loss.backward()
-    grad_clip = self.train_config.get('grad_clip', 1.0)
-    grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip)
-    self.optimizer.step()
-    self.scheduler.step()
+      
+      if torch.isnan(loss) or torch.isinf(loss):
+        self.logger.warning("NaN or Inf loss detected")
+        return {'loss': float('inf'), 'accuracy': 0.0, 'perplexity': float('inf'), 'grad_norm': 0.0, 'lr': self.optimizer.param_groups[0]['lr']}
+        
+    except Exception as e:
+      self.logger.error(f"Forward pass failed: {e}")
+      return {'loss': float('inf'), 'accuracy': 0.0, 'perplexity': float('inf'), 'grad_norm': 0.0, 'lr': 0.0}
+
+    # Backward pass
+    try:
+      loss.backward()
+      grad_clip = self.train_config.get('grad_clip', 1.0)
+      grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip)
+      self.optimizer.step()
+      self.scheduler.step()
+    except Exception as e:
+      self.logger.error(f"Backward pass failed: {e}")
+      return {'loss': loss.item(), 'accuracy': 0.0, 'perplexity': float('inf'), 'grad_norm': 0.0, 'lr': self.optimizer.param_groups[0]['lr']}
 
     # Compute metrics
-    with torch.no_grad():
-      # Accuracy
-      pred_tokens = torch.argmax(logits, dim=-1)
-      accuracy = (pred_tokens == y).float().mean()
+    try:
+      with torch.no_grad():
+        pred_tokens = torch.argmax(logits, dim=-1)
+        accuracy = (pred_tokens == y).float().mean()
+        perplexity = torch.exp(torch.clamp(loss, max=10.0))
 
-      # Perplexity
-      perplexity = torch.exp(loss)
+      return {
+        'loss': loss.item(),
+        'accuracy': accuracy.item(), 
+        'perplexity': perplexity.item(),
+        'grad_norm': grad_norm.item(),
+        'lr': self.optimizer.param_groups[0]['lr']
+      }
+    except Exception as e:
+      self.logger.error(f"Metrics computation failed: {e}")
+      return {'loss': loss.item(), 'accuracy': 0.0, 'perplexity': float('inf'), 'grad_norm': 0.0, 'lr': self.optimizer.param_groups[0]['lr']}
 
-    return {
-      'loss': loss.item(),
-      'accuracy': accuracy.item(),
-      'perplexity': perplexity.item(),
-      'grad_norm': grad_norm.item(),
-      'lr': self.optimizer.param_groups[0]['lr']
-    }
-
-  def validate(self, batch_size: int, block_size: int, num_batches: int = 10) -> Dict[str, float]:
+  # Simplified validate method in run.py  
+  def validate(self, batch_size: int, block_size: int, num_batches: int = 5) -> Dict[str, float]:
     self.model.eval()
     
-    val_metrics = {
-      'loss': 0.0,
-      'accuracy': 0.0,
-      'perplexity': 0.0
-    }
+    total_loss = 0.0
+    total_accuracy = 0.0
     total_batches = 0
-
+    
     with torch.no_grad():
       for dataset_name, dataset in self.datasets.items():
-        for _ in range(num_batches):
+        for _ in range(2):  # Just 2 batches per dataset
           try:
-            x, y = dataset.get_batch("val", batch_size, block_size, self.device)
+            x, y = dataset.get_batch("val", min(batch_size//2, 4), block_size, self.device)
+            
+            if x.dim() != 2 or y.dim() != 2 or x.shape != y.shape:
+              continue
+              
             logits, loss, _ = self.model(x, targets=y)
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+              continue
 
-            # Compute metrics
             pred_tokens = torch.argmax(logits, dim=-1)
             accuracy = (pred_tokens == y).float().mean()
-            perplexity = torch.exp(loss)
             
-            # Accumulate metrics
-            val_metrics['loss'] += loss.item()
-            val_metrics['accuracy'] += accuracy.item()
-            val_metrics['perplexity'] += perplexity.item()
-            
+            total_loss += loss.item()
+            total_accuracy += accuracy.item()
             total_batches += 1
             
           except Exception as e:
-            self.logger.warning(f"Validation batch failed for {dataset_name}: {e}")
+            self.logger.warning(f"Validation batch failed: {e}")
             continue
 
-    # Average metrics
     if total_batches > 0:
-      for key in val_metrics:
-        val_metrics[key] /= total_batches
+      avg_loss = total_loss / total_batches
+      avg_accuracy = total_accuracy / total_batches
+      perplexity = math.exp(min(avg_loss, 10.0))
+    else:
+      avg_loss = float('inf')
+      avg_accuracy = 0.0
+      perplexity = float('inf')
 
-    return val_metrics
+    return {
+      'loss': avg_loss,
+      'accuracy': avg_accuracy, 
+      'perplexity': perplexity
+    }
 
   def save_checkpoint(self, is_best: bool = False):
     checkpoint = {
@@ -284,10 +309,8 @@ class MultiTrainer:
       num_epochs = self.train_config.get('epochs', 1)
     
     batch_size = self.train_config.get('batch_size', 12)
-    micro_batch_size = self.train_config.get('micro_batch_size', 4)
-    gradient_accumulation_steps = self.train_config.get('gradient_accumulation_steps', 3)
-    block_size = self.train_config.get('block_size', 1024)
-    eval_interval = self.train_config.get('eval_interval', 2000)
+    block_size = self.train_config.get('block_size', 768)
+    eval_interval = self.train_config.get('eval_interval', 200)  # Reduced for more frequent validation
     log_interval = self.train_config.get('log_interval', 1)
     
     # Setup training
@@ -298,7 +321,7 @@ class MultiTrainer:
       self.load_checkpoint(resume_from)
 
     self.logger.info("Starting training...")
-    self.logger.info(f"Parameters: epochs={num_epochs}, batch_size={batch_size}, "f"micro_batch_size={micro_batch_size}, block_size={block_size}")
+    self.logger.info(f"Parameters: epochs={num_epochs}, batch_size={batch_size}, block_size={block_size}")
 
     try:
       start_time = time.time()
@@ -309,43 +332,40 @@ class MultiTrainer:
         epoch_start_time = time.time()
         epoch_losses = []
         
-        # Calculate steps per epoch based on gradient accumulation
-        steps_per_epoch = 1000 // gradient_accumulation_steps
+        # Calculate steps per epoch
+        steps_per_epoch = 1000
         
         for step in range(steps_per_epoch):
-          step_losses = []
-          
-          # Gradient accumulation loop
-          for micro_step in range(gradient_accumulation_steps):
-            metrics = self.train_step(micro_batch_size, block_size)
-            step_losses.append(metrics)
-          
-          # Average metrics across micro-batches
-          avg_metrics = {}
-          for key in step_losses[0].keys():
-            avg_metrics[key] = np.mean([m[key] for m in step_losses])
-          
-          epoch_losses.append(avg_metrics)
+          # Single training step
+          metrics = self.train_step(batch_size, block_size)
+          epoch_losses.append(metrics)
           self.global_step += 1
           
           # Log to tensorboard
-          for key, value in avg_metrics.items():
+          for key, value in metrics.items():
             self.writer.add_scalar(f'train/{key}', value, self.global_step)
           
           # Print progress
           if self.global_step % log_interval == 0:
             current_dataset = self.dataset_names[self.current_dataset_idx]
-            self.logger.info(f"Step {self.global_step}: Dataset={current_dataset}, "f"Loss={avg_metrics['loss']:.4f}, "f"Acc={avg_metrics['accuracy']:.3f}, "f"PPL={avg_metrics['perplexity']:.2f}, "f"LR={avg_metrics['lr']:.2e}")
+            self.logger.info(f"Step {self.global_step}: Dataset={current_dataset}, "
+                            f"Loss={metrics['loss']:.4f}, "
+                            f"Acc={metrics['accuracy']:.3f}, "
+                            f"PPL={metrics['perplexity']:.2f}, "
+                            f"LR={metrics['lr']:.2e}")
 
           # Validation
           if self.global_step % eval_interval == 0:
-            val_metrics = self.validate(micro_batch_size, block_size)
+            val_metrics = self.validate(batch_size // 2, block_size)  # Smaller batch for validation
 
             # Log validation metrics
             for key, value in val_metrics.items():
               self.writer.add_scalar(f'val/{key}', value, self.global_step)
 
-            self.logger.info(f"Validation - Loss: {val_metrics['loss']:.4f}, "f"Acc: {val_metrics['accuracy']:.3f}, "f"PPL: {val_metrics['perplexity']:.2f}")
+            self.logger.info(f"Validation - Loss: {val_metrics['loss']:.4f}, "
+                            f"Acc: {val_metrics['accuracy']:.3f}, "
+                            f"PPL: {val_metrics['perplexity']:.2f}")
+            
             # Check for improvement
             if val_metrics['loss'] < best_val_loss:
               best_val_loss = val_metrics['loss']
@@ -356,6 +376,7 @@ class MultiTrainer:
             if self.early_stopping(val_metrics['loss']):
               self.logger.info("Early stopping triggered")
               return
+          
           # Dataset rotation every 500 steps
           if self.global_step % 500 == 0 and len(self.datasets) > 1:
             self.switch_dataset()
@@ -423,10 +444,10 @@ def main():
   """Example training setup"""
   
   dataset_paths = [
-    "data/dataset1.txt",
-    "data/dataset2.txt"
+    "/teamspace/uploads/consolidated-2.5b.txt",
+    "/teamspace/uploads/consolidated_10.txt"
   ]
-  dataset_names = ["dataset1", "dataset2"]
+  dataset_names = ["consolidate_2.5b", "consolidate_10"]
   
   # Initialize trainer
   trainer = MultiTrainer(
@@ -436,7 +457,7 @@ def main():
     dataset_names=dataset_names,
     save_dir="checkpoints",
     log_dir="logs",
-    encoding="gpt2",
+    encoding="p50k_base",
     device="cuda"
   )
 

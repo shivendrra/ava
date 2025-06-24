@@ -33,12 +33,19 @@ def rotate_half(x):
 def apply_rope_x(x, cos, sin):
   return (x * cos) + (rotate_half(x) * sin)
 
+
+# Fixed MLA class in moe.py
 class MLA(nn.Module):
   def __init__(self, d_model, n_heads, max_len=1024, rope_theta=10000.0):
     super().__init__()
     self.d_model = d_model
     self.n_heads = n_heads
     self.dh = d_model // n_heads
+    
+    # Ensure head dimension is even for RoPE splitting
+    if self.dh % 2 != 0:
+      raise ValueError(f"Head dimension {self.dh} must be even for RoPE")
+    
     self.qk_nope_dim = self.dh // 2
     self.qk_rope_dim = self.dh - self.qk_nope_dim
 
@@ -47,10 +54,9 @@ class MLA(nn.Module):
     self.v_proj = nn.Linear(d_model, d_model, bias=False)
     self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
-    # Pre-compute and cache RoPE embeddings
-    rope_dim = self.qk_rope_dim
-    if rope_dim > 0:
-      freqs = 1.0 / (rope_theta ** (torch.arange(0, rope_dim, 2).float() / rope_dim))
+    # Pre-compute RoPE embeddings
+    if self.qk_rope_dim > 0:
+      freqs = 1.0 / (rope_theta ** (torch.arange(0, self.qk_rope_dim, 2).float() / self.qk_rope_dim))
       emb = torch.outer(torch.arange(max_len).float(), freqs)
       cos_cached = emb.cos()[None, None, :, :]
       sin_cached = emb.sin()[None, None, :, :]
@@ -63,93 +69,59 @@ class MLA(nn.Module):
 
   def forward(self, x, kv_cache=None, past_length=0, is_causal=True):
     B, S, D = x.size()
-
-    # Validate input dimensions
-    assert D == self.d_model, f"Input dim {D} != model dim {self.d_model}"
-    assert S <= self.cos_cached.size(2), f"Sequence length {S} > max_len {self.cos_cached.size(2)}"
-
-    # More memory efficient projections
-    Q = self.q_proj(x).view(B, S, self.n_heads, self.dh).transpose(1, 2)
-    K = self.k_proj(x).view(B, S, self.n_heads, self.dh).transpose(1, 2)
-    V = self.v_proj(x).view(B, S, self.n_heads, self.dh).transpose(1, 2)
-
-    # Split Q and K for RoPE
-    if self.qk_rope_dim > 0:
-      Q_nope, Q_rope = torch.split(Q, [self.qk_nope_dim, self.qk_rope_dim], dim=-1)
-      K_nope, K_rope = torch.split(K, [self.qk_nope_dim, self.qk_rope_dim], dim=-1)
-    else:
-      Q_nope, Q_rope = Q, torch.empty_like(Q[:, :, :, :0])
-      K_nope, K_rope = K, torch.empty_like(K[:, :, :, :0])
-
-    # Handle KV cache more efficiently
-    if kv_cache is not None:
-      past_K_nope, past_K_rope, past_V = kv_cache
-      K_nope = torch.cat([past_K_nope, K_nope], dim=2)
-      if self.qk_rope_dim > 0:
-        K_rope = torch.cat([past_K_rope, K_rope], dim=2)
-      V = torch.cat([past_V, V], dim=2)
-
-    S_full = K_nope.size(2)
-
-    # Apply RoPE more efficiently
-    if self.qk_rope_dim > 0:
-      rope_dim_half = self.qk_rope_dim // 2
-      
-      # Ensure indices are within bounds
-      start_pos = max(0, min(past_length, self.cos_cached.size(2) - S))
-      end_pos = min(start_pos + S, self.cos_cached.size(2))
-      start_full = min(S_full, self.cos_cached.size(2))
-      
-      if end_pos > start_pos and rope_dim_half > 0:
-        cos_q = self.cos_cached[:, :, start_pos:end_pos, :rope_dim_half]
-        sin_q = self.sin_cached[:, :, start_pos:end_pos, :rope_dim_half]
-        
-        # Ensure shapes match
-        if cos_q.size(2) == S:
-          cos_q = cos_q.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
-          sin_q = sin_q.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
-          Q_rope = apply_rope_x(Q_rope, cos_q, sin_q)
-
-        cos_k = self.cos_cached[:, :, :start_full, :rope_dim_half]
-        sin_k = self.sin_cached[:, :, :start_full, :rope_dim_half]
-        
-        if cos_k.size(2) == S_full:
-          cos_k = cos_k.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
-          sin_k = sin_k.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
-          K_rope = apply_rope_x(K_rope, cos_k, sin_k)
-
-    # Reconstruct Q and K
-    Q_final = torch.cat([Q_nope, Q_rope], dim=-1) if self.qk_rope_dim > 0 else Q_nope
-    K_final = torch.cat([K_nope, K_rope], dim=-1) if self.qk_rope_dim > 0 else K_nope
-
-    # Use PyTorch's optimized attention with proper error handling
-    try:
-      x = F.scaled_dot_product_attention(
-        Q_final, K_final, V, 
-        attn_mask=None, 
-        dropout_p=0.0 if not self.training else 0.1,
-        is_causal=is_causal and (past_length == 0)
-      )
-    except Exception as e:
-      # Fallback to manual attention if scaled_dot_product_attention fails
-      scale = 1.0 / math.sqrt(self.dh)
-      scores = torch.matmul(Q_final, K_final.transpose(-2, -1)) * scale
-      
-      if is_causal and past_length == 0:
-        mask = torch.tril(torch.ones(S, S_full, device=x.device, dtype=torch.bool))
-        scores = scores.masked_fill(~mask, float('-inf'))
-      
-      attn_weights = F.softmax(scores, dim=-1)
-      if self.training:
-        attn_weights = F.dropout(attn_weights, p=0.1)
-      x = torch.matmul(attn_weights, V)
     
-    x = x.transpose(1, 2).reshape(B, S, D)
-    x = self.o_proj(x)
+    # Validate dimensions
+    if D != self.d_model:
+      raise ValueError(f"Input dim {D} != model dim {self.d_model}")
     
-    # Return new cache only if needed
-    new_kv_cache = (K_nope, K_rope, V) if kv_cache is not None or past_length > 0 else None
-    return x, new_kv_cache
+    # Project to Q, K, V
+    Q = self.q_proj(x)  # [B, S, D]
+    K = self.k_proj(x)  # [B, S, D] 
+    V = self.v_proj(x)  # [B, S, D]
+    
+    # Reshape to [B, n_heads, S, head_dim]
+    Q = Q.view(B, S, self.n_heads, self.dh).transpose(1, 2)
+    K = K.view(B, S, self.n_heads, self.dh).transpose(1, 2)
+    V = V.view(B, S, self.n_heads, self.dh).transpose(1, 2)
+
+    # Apply RoPE if enabled
+    if self.qk_rope_dim > 0:
+      Q_nope, Q_rope = Q.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1)
+      K_nope, K_rope = K.split([self.qk_nope_dim, self.qk_rope_dim], dim=-1)
+      
+      # Apply rotary embeddings
+      seq_len = Q_rope.size(2)
+      cos = self.cos_cached[:, :, :seq_len, :self.qk_rope_dim//2]
+      sin = self.sin_cached[:, :, :seq_len, :self.qk_rope_dim//2]
+      
+      # Expand cos/sin to match rope dimension
+      cos = cos.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
+      sin = sin.repeat(1, 1, 1, 2)[:, :, :, :self.qk_rope_dim]
+      
+      Q_rope = apply_rope_x(Q_rope, cos, sin)
+      K_rope = apply_rope_x(K_rope, cos, sin)
+      
+      Q = torch.cat([Q_nope, Q_rope], dim=-1)
+      K = torch.cat([K_nope, K_rope], dim=-1)
+
+    # Attention computation
+    scale = 1.0 / math.sqrt(self.dh)
+    scores = torch.matmul(Q, K.transpose(-2, -1)) * scale  # [B, n_heads, S, S]
+    
+    if is_causal:
+      # Create causal mask with correct shape [1, 1, S, S] for broadcasting
+      mask = torch.tril(torch.ones(S, S, device=x.device, dtype=torch.bool))
+      mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
+      scores = scores.masked_fill(~mask, float('-inf'))
+    
+    attn_weights = F.softmax(scores, dim=-1)
+    if self.training:
+      attn_weights = F.dropout(attn_weights, p=0.1)
+
+    out = torch.matmul(attn_weights, V)
+    out = out.transpose(1, 2).contiguous().view(B, S, D)
+    out = self.o_proj(out)  
+    return out, None
 
 class Expert(nn.Module):
   def __init__(self, d_model, hidden_dim, dropout, ffn_multiplier=None):
@@ -206,76 +178,52 @@ class SparseMoE(nn.Module):
     self.n_experts = max(1, n_experts)
     self.top_k = min(top_k, self.n_experts)
     
-    self.router = NoisyTopkRouter(d_model, self.n_experts, self.top_k)
-    self.experts = nn.ModuleList([
-      Expert(d_model, n_ff, dropout, ffn_multiplier) 
-      for _ in range(self.n_experts)
-    ])
-    self.capacity_factor = capacity_factor
+    if self.n_experts == 1:
+      # Single expert case - just use a regular FFN
+      hidden_dim = int(2 * n_ff / 3)
+      if ffn_multiplier is not None:
+        hidden_dim = int(ffn_multiplier * hidden_dim)
+      self.single_expert = Expert(d_model, hidden_dim, dropout, ffn_multiplier)
+    else:
+      self.router = NoisyTopkRouter(d_model, self.n_experts, self.top_k)
+      self.experts = nn.ModuleList([
+        Expert(d_model, n_ff, dropout, ffn_multiplier) 
+        for _ in range(self.n_experts)
+      ])
 
   def forward(self, x):
-    batch_size, seq_len, d_model = x.shape
-    original_shape = x.shape
-    
-    # Handle single expert case
     if self.n_experts == 1:
-      return self.experts[0](x)
+      return self.single_expert(x)
     
-    # Flatten input for processing
-    flat_x = x.view(-1, d_model)
+    B, S, D = x.shape
+    x_flat = x.view(-1, D)  # [B*S, D]
     
     # Get routing decisions
-    gating_output, indices = self.router(x)
-    flat_gating_output = gating_output.view(-1, self.n_experts)
-    flat_indices = indices.view(-1, self.top_k)
-
-    # Initialize output tensor
-    final_output = torch.zeros_like(flat_x)
+    gating_output, indices = self.router(x)  # gating: [B, S, n_experts], indices: [B, S, top_k]
     
-    # Calculate expert capacity more conservatively
-    total_tokens = flat_x.size(0)
-    tokens_per_expert = max(1, (total_tokens * self.top_k) // self.n_experts)
-    expert_capacity = max(8, int(tokens_per_expert * self.capacity_factor))
-
-    # Process each expert more safely
-    for expert_idx in range(self.n_experts):
-      # Find tokens assigned to this expert
-      expert_mask = (flat_indices == expert_idx).any(dim=-1)
-      expert_tokens = torch.nonzero(expert_mask, as_tuple=False).squeeze(-1)
-
-      if expert_tokens.numel() == 0:
-        continue
-        
-      # Apply capacity limit to prevent OOM
-      if expert_tokens.numel() > expert_capacity:
-        # Randomly sample tokens to maintain diversity
-        perm = torch.randperm(expert_tokens.numel(), device=expert_tokens.device)
-        expert_tokens = expert_tokens[perm[:expert_capacity]]
+    # Flatten for easier processing
+    gating_flat = gating_output.view(-1, self.n_experts)  # [B*S, n_experts]
+    indices_flat = indices.view(-1, self.top_k)  # [B*S, top_k]
+    
+    # Initialize output
+    output_flat = torch.zeros_like(x_flat)  # [B*S, D]
+    
+    # Process each token position
+    for i in range(B * S):
+      token_input = x_flat[i:i+1]  # [1, D]
+      token_gating = gating_flat[i]  # [n_experts]
+      token_indices = indices_flat[i]  # [top_k]
       
-      # Ensure indices are valid
-      expert_tokens = expert_tokens[expert_tokens < flat_x.size(0)]
-      
-      if expert_tokens.numel() == 0:
-        continue
-      
-      try:
-        # Process tokens through expert
-        expert_input = flat_x[expert_tokens]
-        expert_output = self.experts[expert_idx](expert_input)
-        
-        # Get gating weights for these tokens - use advanced indexing more safely
-        expert_gating = flat_gating_output[expert_tokens]
-        gating_weights = expert_gating[:, expert_idx:expert_idx+1]
-        weighted_output = expert_output * gating_weights
-        
-        # Add to final output using scatter_add for memory efficiency
-        final_output.scatter_add_(0, expert_tokens.unsqueeze(-1).expand_as(weighted_output), weighted_output)
-        
-      except Exception as e:
-        # Skip this expert if there's an error to prevent training crash
-        continue
-
-    return final_output.view(original_shape)
+      # Apply selected experts
+      for k in range(self.top_k):
+        expert_idx = token_indices[k].item()
+        if expert_idx < self.n_experts:  # Safety check
+          expert_weight = token_gating[expert_idx]
+          if expert_weight > 1e-6:  # Skip negligible weights
+            expert_output = self.experts[expert_idx](token_input)  # [1, D]
+            output_flat[i] += expert_weight * expert_output.squeeze(0)
+    
+    return output_flat.view(B, S, D)
 
 class Block(nn.Module):
   def __init__(self, d_model, n_heads, n_experts, top_k, n_ff, dropout, ffn_multiplier, block_size, capacity_factor, rope_theta=10000.0):
